@@ -1,0 +1,2572 @@
+diff --git a/meson.build b/meson.build
+index eb555bf..42b8e1c 100644
+--- a/meson.build
++++ b/meson.build
+@@ -415,6 +415,31 @@ if get_option('ubsan')
+ endif
+ 
+ 
++# Keep the legacy USB stack for all targets except the opt-in TYT builds.
++tyt_mcu_src = stm32f405_src
++tyt_usb_src = []
++tyt_usb_inc = []
++tyt_usb_def = {}
++if get_option('usb_audio')
++  tinyusb_proj = subproject('tinyusb')
++  tyt_mcu_src = []
++  foreach source : stm32f405_src
++    if not source.contains('/drivers/usb/') and not source.endswith('/usb_vcom.c')
++      tyt_mcu_src += source
++    endif
++  endforeach
++  tyt_usb_src = tinyusb_proj.get_variable('tinyusb_src') + files(
++    'platform/drivers/USB/tyt/usb_descriptors.c',
++    'platform/drivers/USB/tyt/usb_mixer.c',
++    'platform/drivers/USB/tyt/usb_rx.c',
++    'platform/drivers/USB/tyt/usb_composite.cpp',
++    'openrtx/src/core/usb_audio.c',
++    'openrtx/src/core/usb_frame.c',
++    'openrtx/src/core/usb_control.c')
++  tyt_usb_inc = ['platform/drivers/USB/tyt', 'subprojects/tinyusb/src']
++  tyt_usb_def = {'CONFIG_USB_AUDIO': ''}
++endif
++
+ ##
+ ## TYT MD-3x0 family
+ ##
+@@ -433,9 +458,9 @@ md3x0_src = ['platform/drivers/CPS/cps_io_native_tyt.c',
+ md3x0_inc = ['platform/targets/MD-3x0']
+ md3x0_def = {'CONFIG_TYT_CPS': '', 'PLATFORM_MD3x0': '', 'timegm': 'mktime'}
+ 
+-md3x0_src += openrtx_src + stm32f405_src + ui_src_default + mdx_src
+-md3x0_inc += openrtx_inc + stm32f405_inc
+-md3x0_def += openrtx_def + stm32f405_def
++md3x0_src += openrtx_src + tyt_mcu_src + ui_src_default + mdx_src + tyt_usb_src
++md3x0_inc += openrtx_inc + stm32f405_inc + tyt_usb_inc
++md3x0_def += openrtx_def + stm32f405_def + tyt_usb_def
+ 
+ ##
+ ## TYT MD-UV380
+@@ -457,9 +482,9 @@ mduv3x0_src = ['platform/drivers/CPS/cps_io_native_tyt.c',
+ mduv3x0_inc = ['platform/targets/MD-UV3x0']
+ mduv3x0_def =  {'CONFIG_TYT_CPS': '', 'PLATFORM_MDUV3x0': '', 'timegm': 'mktime'}
+ 
+-mduv3x0_src += openrtx_src + stm32f405_src + ui_src_default + mdx_src
+-mduv3x0_inc += openrtx_inc + stm32f405_inc
+-mduv3x0_def += openrtx_def + stm32f405_def
++mduv3x0_src += openrtx_src + tyt_mcu_src + ui_src_default + mdx_src + tyt_usb_src
++mduv3x0_inc += openrtx_inc + stm32f405_inc + tyt_usb_inc
++mduv3x0_def += openrtx_def + stm32f405_def + tyt_usb_def
+ 
+ ##
+ ## TYT MD-9600
+@@ -596,7 +621,7 @@ cs7000p_def += openrtx_def + stm32h743_def + miosix_cm7_def
+ dm1701_src = ['platform/targets/DM-1701/platform.c',
+               'platform/targets/DM-1701/hwconfig.c',
+               'platform/drivers/keyboard/keyboard_DM1701.c',
+-              'platform/drivers/CPS/cps_io_native_tyt.c',
++              'platform/drivers/CPS/cps_io_native_MDUV3x0.c',
+               'platform/drivers/display/HX8353_MD3x.cpp',
+               'platform/drivers/backlight/backlight_MDx.c',
+               'platform/drivers/chSelector/chSelector_UV3x0.c',
+diff --git a/meson_options.txt b/meson_options.txt
+index 9d797cb..52b180f 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -1,3 +1,5 @@
+ option('asan', type : 'boolean', value : false, description : 'Compile the software with AddressSanitizer')
+ option('ubsan', type : 'boolean', value : false, description : 'Compile the software with Undefined Behaviour Sanitizer')
+ option('test', type: 'string', description: 'Replace the main OpenRTX source file with a specialized test')
++
++option('usb_audio', type: 'boolean', value: false, description: 'Experimental TYT UAC1 + framed CDC control')
+diff --git a/openrtx/include/core/threads.h b/openrtx/include/core/threads.h
+index a94ea9e..c7c8f33 100644
+--- a/openrtx/include/core/threads.h
++++ b/openrtx/include/core/threads.h
+@@ -13,7 +13,11 @@
+  * Threads' stack sizes
+  */
+ #define UI_THREAD_STKSIZE     2048
++#ifdef CONFIG_USB_AUDIO
++#define RTX_THREAD_STKSIZE    2048
++#else
+ #define RTX_THREAD_STKSIZE    512
++#endif
+ #define CODEC2_THREAD_STKSIZE 16384
+ #define AUDIO_THREAD_STKSIZE  512
+ 
+@@ -32,4 +36,7 @@
+  */
+ void create_threads();
+ 
++/** Join the RTX thread after setting SHUTDOWN, before destroying its drivers. */
++void threads_joinRtx();
++
+ #endif /* THREADS_H */
+diff --git a/openrtx/include/interfaces/radio.h b/openrtx/include/interfaces/radio.h
+index 6eda393..0249683 100644
+--- a/openrtx/include/interfaces/radio.h
++++ b/openrtx/include/interfaces/radio.h
+@@ -77,6 +77,12 @@ void radio_enableRx();
+  */
+ void radio_enableTx();
+ 
++/** Select FM modulation from the microphone (false) or MCU line input (true).
++ * Implemented by targets with CONFIG_USB_AUDIO. Called by the rtx thread
++ * while RF is disabled, before enabling TX.
++ */
++void radio_setTxAudioSource(bool fromMcu);
++
+ /**
+  * Disable both the RX and TX stages, as long as transmission of CTC/DCS code
+  * and digital squelch.
+diff --git a/openrtx/include/rtx/OpMode_FM.hpp b/openrtx/include/rtx/OpMode_FM.hpp
+index defd35d..3b0a408 100644
+--- a/openrtx/include/rtx/OpMode_FM.hpp
++++ b/openrtx/include/rtx/OpMode_FM.hpp
+@@ -77,6 +77,11 @@ public:
+ 
+ private:
+ 
++    #ifdef CONFIG_USB_AUDIO
++    bool usbTx = false;       ///< USB source latched for this transmission.
++    bool txTimedOut = false;  ///< Requires all PTT sources to be released.
++    uint64_t txStarted = 0;   ///< Hard timeout applies to local and USB PTT.
++    #endif
+     bool   rfSqlOpen;   ///< Flag for RF squelch status (analog squelch).
+     bool   sqlOpen;     ///< Flag for squelch status.
+     bool   enterRx;     ///< Flag for RX management.
+diff --git a/openrtx/src/core/openrtx.c b/openrtx/src/core/openrtx.c
+index 9bac976..4abfebd 100644
+--- a/openrtx/src/core/openrtx.c
++++ b/openrtx/src/core/openrtx.c
+@@ -15,6 +15,10 @@
+ #include "core/threads.h"
+ #include "core/state.h"
+ #include "core/ui.h"
++#ifdef CONFIG_USB_AUDIO
++#include "interfaces/usb_audio.h"
++#include <stdio.h>
++#endif
+ #ifdef PLATFORM_LINUX
+ #include <stdlib.h>
+ #endif
+@@ -55,6 +59,9 @@ void openrtx_init()
+     }
+     #endif
+ 
++    #ifdef CONFIG_USB_AUDIO
++    if (usbAudio_init() < 0) puts("USB service thread failed");
++    #endif
+ 
+     gfx_init();         // Initialize display and graphics driver
+     kbd_init();         // Initialize keyboard driver
+@@ -85,6 +92,10 @@ void *openrtx_run(void *arg)
+     main_thread(NULL);
+ 
+     // Device thread terminated, complete shutdown sequence
++    #ifdef CONFIG_USB_AUDIO
++    threads_joinRtx();
++    usbAudio_terminate();
++    #endif
+     state_terminate();
+     platform_terminate();
+ 
+diff --git a/openrtx/src/core/threads.c b/openrtx/src/core/threads.c
+index 537c23b..9fec881 100644
+--- a/openrtx/src/core/threads.c
++++ b/openrtx/src/core/threads.c
+@@ -28,6 +28,7 @@
+ 
+ /* Mutex for concurrent access to RTX state variable */
+ pthread_mutex_t rtx_mutex;
++static pthread_t rtx_thread;
+ 
+ /**
+  * \internal Thread managing user input and UI
+@@ -75,10 +76,15 @@ void *ui_threadFunc(void *arg)
+             rtx_cfg.txFrequency = state.channel.tx_frequency;
+             rtx_cfg.txPower     = state.channel.power;
+             rtx_cfg.sqlLevel    = state.settings.sqlLevel;
+-            rtx_cfg.rxToneEn    = state.channel.fm.rxToneEn;
+-            rtx_cfg.rxTone      = ctcss_tone[state.channel.fm.rxTone];
+-            rtx_cfg.txToneEn    = state.channel.fm.txToneEn;
+-            rtx_cfg.txTone      = ctcss_tone[state.channel.fm.txTone];
++            bool fm = state.channel.mode == OPMODE_FM;
++            uint8_t rxTone = state.channel.fm.rxTone;
++            uint8_t txTone = state.channel.fm.txTone;
++            rtx_cfg.rxToneEn = fm && state.channel.fm.rxToneEn &&
++                              (rxTone < CTCSS_FREQ_NUM);
++            rtx_cfg.txToneEn = fm && state.channel.fm.txToneEn &&
++                              (txTone < CTCSS_FREQ_NUM);
++            rtx_cfg.rxTone = rtx_cfg.rxToneEn ? ctcss_tone[rxTone] : 0;
++            rtx_cfg.txTone = rtx_cfg.txToneEn ? ctcss_tone[txTone] : 0;
+             rtx_cfg.toneEn      = state.tone_enabled;
+ 
+             // Enable Tx if channel allows it and we are in UI main screen
+@@ -203,7 +209,6 @@ void create_threads()
+     pthread_attr_setschedparam(&rtx_attr, &param);
+     #endif
+ 
+-    pthread_t rtx_thread;
+     pthread_create(&rtx_thread, &rtx_attr, rtx_threadFunc, NULL);
+ 
+     // Create UI thread
+@@ -220,3 +225,8 @@ void create_threads()
+     pthread_t ui_thread;
+     pthread_create(&ui_thread, &ui_attr, ui_threadFunc, NULL);
+ }
++
++void threads_joinRtx()
++{
++    pthread_join(rtx_thread, NULL);
++}
+diff --git a/openrtx/src/rtx/OpMode_FM.cpp b/openrtx/src/rtx/OpMode_FM.cpp
+index 9d4901c..7e70484 100644
+--- a/openrtx/src/rtx/OpMode_FM.cpp
++++ b/openrtx/src/rtx/OpMode_FM.cpp
+@@ -10,6 +10,11 @@
+ #include "rtx/OpMode_FM.hpp"
+ #include "rtx/rtx.h"
+ 
++#ifdef CONFIG_USB_AUDIO
++#include "interfaces/usb_audio.h"
++#include "core/usb_audio.h"
++#endif
++
+ #if defined(PLATFORM_TTWRPLUS)
+ #include "drivers/baseband/AT1846S.h"
+ #endif
+@@ -55,12 +60,21 @@ void OpMode_FM::enable()
+ 
+ void OpMode_FM::disable()
+ {
++    #ifdef CONFIG_USB_AUDIO
++    usbAudio_setFmRx(false);
++    usbAudioBridge_stop();
++    usbAudio_releasePtt();
++    usbTx = false;
++    #endif
+     // Clean shutdown.
+     platform_ledOff(GREEN);
+     platform_ledOff(RED);
+     audioPath_release(rxAudioPath);
+     audioPath_release(txAudioPath);
+     radio_disableRtx();
++    #ifdef CONFIG_USB_AUDIO
++    radio_setTxAudioSource(false);
++    #endif
+     rfSqlOpen = false;
+     sqlOpen   = false;
+     enterRx   = false;
+@@ -82,6 +96,9 @@ void OpMode_FM::update(rtxStatus_t *const status, const bool newCfg)
+         // This turns squelch (0 to 15) into RSSI (-127.0dbm to -61dbm)
+         rssi_t squelch = -127 + (status->sqlLevel * 66) / 15;
+         rssi_t rssi    = rtx_getRssi();
++        #ifdef CONFIG_USB_AUDIO
++        usbAudio_setRxRssi(rssi);
++        #endif
+ 
+         // Provide a bit of hysteresis, only change state if the RSSI has
+         // moved more than 1dBm on either side of the current squelch setting.
+@@ -115,22 +132,60 @@ void OpMode_FM::update(rtxStatus_t *const status, const bool newCfg)
+     }
+ 
+     // TX logic
+-    if(platform_getPttStatus() && (status->opStatus != TX) &&
++    bool pttRequested = platform_getPttStatus();
++    #ifdef CONFIG_USB_AUDIO
++    bool usbRequested = usbAudio_ptt();
++    pttRequested = pttRequested || usbRequested;
++    if (!pttRequested) txTimedOut = false;
++    if ((status->opStatus == TX) && (getTick() - txStarted >= 60000))
++        txTimedOut = true;
++    if (usbTx && !usbAudio_playing()) txTimedOut = true;
++    if (txTimedOut) pttRequested = false;
++    #endif
++    if(pttRequested && (status->opStatus != TX) &&
+                                   (status->txDisable == 0))
+     {
++        #ifdef CONFIG_USB_AUDIO
++        usbAudioBridge_stop();
++        #endif
+         audioPath_release(rxAudioPath);
+         radio_disableRtx();
+ 
++        #ifdef CONFIG_USB_AUDIO
++        usbTx = usbRequested || usbAudio_playing();
++        txAudioPath = audioPath_request(usbTx ? SOURCE_MCU : SOURCE_MIC,
++                                       SINK_RTX, PRIO_TX);
++        if ((txAudioPath <= 0) ||
++            (usbTx && (!usbAudio_playing() ||
++                       (usbAudioBridge_startTx(txAudioPath) < 0)))) {
++            audioPath_release(txAudioPath);
++            usbTx = false;
++            status->opStatus = OFF;
++            enterRx = true;
++            sqlOpen = false;
++            sleepFor(0, 10);
++            return;
++        }
++        radio_setTxAudioSource(usbTx);
++        txStarted = getTick();
++        #else
+         txAudioPath = audioPath_request(SOURCE_MIC, SINK_RTX, PRIO_TX);
++        #endif
+         radio_enableTx();
+-
+         status->opStatus = TX;
+     }
+ 
+-    if(!platform_getPttStatus() && (status->opStatus == TX))
++    if((!pttRequested || status->txDisable) && (status->opStatus == TX))
+     {
++        #ifdef CONFIG_USB_AUDIO
++        usbAudioBridge_stop();
++        usbTx = false;
++        #endif
+         audioPath_release(txAudioPath);
+         radio_disableRtx();
++        #ifdef CONFIG_USB_AUDIO
++        radio_setTxAudioSource(false);
++        #endif
+ 
+         status->opStatus = OFF;
+         enterRx = true;
+@@ -170,6 +225,23 @@ void OpMode_FM::update(rtxStatus_t *const status, const bool newCfg)
+             break;
+     }
+ 
++    #ifdef CONFIG_USB_AUDIO
++    usbAudio_setFmRx(status->opStatus == RX);
++    if (usbAudioBridge_update(status->opStatus == RX,
++                             (status->opStatus == TX) && usbTx)) return;
++    // A failed DMA stream must not leave RF keyed with stale samples.
++    if ((status->opStatus == TX) && usbTx) {
++        radio_disableRtx();
++        audioPath_release(txAudioPath);
++        radio_setTxAudioSource(false);
++        usbAudio_releasePtt();
++        usbTx = false;
++        txTimedOut = true;
++        status->opStatus = OFF;
++        enterRx = true;
++        sqlOpen = false;
++    }
++    #endif
+     // Sleep thread for 30ms for 33Hz update rate
+     sleepFor(0u, 30u);
+ }
+diff --git a/openrtx/src/ui/default/ui.c b/openrtx/src/ui/default/ui.c
+index 679be11..0500f94 100644
+--- a/openrtx/src/ui/default/ui.c
++++ b/openrtx/src/ui/default/ui.c
+@@ -56,6 +56,9 @@
+ #include "interfaces/platform.h"
+ #include "interfaces/display.h"
+ #include "interfaces/cps_io.h"
++#ifdef CONFIG_USB_AUDIO
++#include "interfaces/usb_audio.h"
++#endif
+ #include "interfaces/nvmem.h"
+ #include "interfaces/delays.h"
+ #include <string.h>
+@@ -621,9 +624,10 @@ static int _ui_fsm_loadChannel(int16_t channel_index, bool *sync_rtx)
+         // Copy channel read to state
+         state.channel = channel;
+         *sync_rtx = true;
++        return result;
+     }
+ 
+-    return result;
++    return -1;
+ }
+ 
+ static void _ui_fsm_confirmVFOInput(bool *sync_rtx)
+@@ -1289,6 +1293,9 @@ void ui_init()
+     // This syntax is called compound literal
+     // https://stackoverflow.com/questions/6891720/initialize-reset-struct-to-zero-null
+     ui_state = (const struct ui_state_t){ 0 };
++    #ifdef CONFIG_TYT_CPS
++    if (cps_fallbackActive()) state.ui_screen = MAIN_MEM;
++    #endif
+ }
+ 
+ void ui_drawSplashScreen()
+@@ -1383,6 +1390,44 @@ static enum vpGPSInfoFlags GetGPSDirectionOrSpeedChanged()
+ 
+ void ui_updateFSM(bool *sync_rtx)
+ {
++#ifdef CONFIG_USB_AUDIO
++    /* Translate bank-relative knob positions to the global USB catalog. */
++    static int32_t priorChannel = -2, priorBank = -2, globalChannel = -1;
++    static bool priorBankEnabled;
++    if (priorChannel != state.channel_index || priorBank != state.bank ||
++        priorBankEnabled != state.bank_enabled) {
++        globalChannel = state.bank_enabled ?
++            cps_readBankData(state.bank, state.channel_index) :
++            state.channel_index;
++        priorChannel = state.channel_index;
++        priorBank = state.bank;
++        priorBankEnabled = state.bank_enabled;
++    }
++    bool memory = state.ui_screen == MAIN_MEM ||
++        (state.ui_screen != MAIN_VFO && state.ui_screen != MAIN_VFO_INPUT &&
++         ui_state.last_main_state == MAIN_MEM);
++    usbAudio_setChannel(memory ? globalChannel : -1,
++                        memory ? state.channel.name : "VFO",
++                        state.channel.rx_frequency, state.channel.tx_frequency);
++    // The UI thread owns channel state and uses the usual channel loader.
++    if (state.rtxStatus != TX && !platform_getPttStatus() && !usbAudio_ptt()) {
++        uint16_t channel;
++        if (usbAudio_takeChannel(&channel)) {
++            bool bankEnabled = state.bank_enabled;
++            if (state.ui_screen == MAIN_VFO) state.vfo_channel = state.channel;
++            state.bank_enabled = false;
++            int loaded = _ui_fsm_loadChannel(channel, sync_rtx);
++            bool success = loaded >= 0 && *sync_rtx;
++            if (success) {
++                state.ui_screen = MAIN_MEM;
++                ui_state.last_main_state = MAIN_MEM;
++                state.txDisable = state.channel.rx_only;
++                redraw_needed = true;
++            } else state.bank_enabled = bankEnabled;
++            usbAudio_channelResult(success);
++        }
++    }
++#endif
+     // Check for events
+     if(evQueue_wrPos == evQueue_rdPos) return;
+ 
+diff --git a/platform/drivers/audio/audio_MDx.cpp b/platform/drivers/audio/audio_MDx.cpp
+index a7a08e9..1957e0f 100644
+--- a/platform/drivers/audio/audio_MDx.cpp
++++ b/platform/drivers/audio/audio_MDx.cpp
+@@ -255,6 +255,13 @@ bool audio_checkPathCompatibility(const enum AudioSource p1Source,
+                                   const enum AudioSink   p2Sink)
+ 
+ {
++    #ifdef CONFIG_USB_AUDIO
++    // The RF ADC tap is independent of the analog speaker path.
++    if ((p1Source == SOURCE_RTX) && (p2Source == SOURCE_RTX) &&
++        (((p1Sink == SINK_SPK) && (p2Sink == SINK_MCU)) ||
++         ((p1Sink == SINK_MCU) && (p2Sink == SINK_SPK)))) return true;
++    #endif
++
+     uint8_t p1Index = (p1Source * 3) + p1Sink;
+     uint8_t p2Index = (p2Source * 3) + p2Sink;
+ 
+diff --git a/platform/drivers/baseband/HR_C6000.cpp b/platform/drivers/baseband/HR_C6000.cpp
+index 0170d49..0d76583 100644
+--- a/platform/drivers/baseband/HR_C6000.cpp
++++ b/platform/drivers/baseband/HR_C6000.cpp
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include "core/utils.h"
++#include <errno.h>
+ #include "drivers/baseband/HR_C6000.h"
+ 
+ /*
+@@ -77,3 +78,92 @@ void HR_C6000::sendTone(const uint32_t freq, const uint8_t deviation)
+     writeCfgRegister(0x60, 0x00);         // Disable FM transmission
+     writeCfgRegister(0x60, 0x80);         // Enable FM transmission, start sending the tone
+ }
++
++int HR_C6000::readFmRxProbe(uint8_t chunk, uint8_t *data, uint8_t *registers)
++{
++    if (chunk >= 16 || data == nullptr || registers == nullptr)
++        return -EINVAL;
++    /* HR_C6000 updated manual, CONFIG 0x10 (mode), 0x81/0x82 (IRQ),
++     * and "RX data register" table: FM RAM 0x030..0x22f, 0x230..0x42f.
++     * https://github.com/open-ham/OpenGD77/tree/main/docs/data_sheets/C6000
++     * Read individual addresses using the existing extended SPI transaction;
++     * do not assume undocumented burst or buffer ownership semantics.
++     */
++    registers[0] = readCfgRegister(0x10);
++    /* ModulatorMode bit 7 selects FM; the lower bits are independent. */
++    constexpr uint8_t fmModeMask = 0x80;
++    if ((registers[0] & fmModeMask) == 0)
++        return -ENOTSUP;
++    registers[1] = readCfgRegister(0x81);
++    registers[2] = readCfgRegister(0x82);
++    uint16_t address = 0x030 + static_cast<uint16_t>(chunk) * 64;
++    for (size_t i = 0; i < 64; ++i)
++        data[i] = readReg16(C6000_SpiOpModes::DATA, address + i);
++    return 0;
++}
++
++void HR_C6000::readFmProbeRegisters(uint8_t *values)
++{
++    /* HR_C6000 CONFIG table: interface, mode, IRQ mask, codec control.
++     * Compare two documented address forms without modifying the chip.
++     */
++    const uint8_t addresses[] = {0x01, 0x10, 0x81, 0xe0};
++    for (size_t i = 0; i < sizeof(addresses); ++i) {
++        values[i] = readCfgRegister(addresses[i]);
++        values[i + 4] = readReg16(C6000_SpiOpModes::CONFIG, addresses[i]);
++    }
++}
++
++int HR_C6000::readFmRxRam(uint16_t offset, uint8_t *data, size_t length)
++{
++    if (data == nullptr || offset >= 1024 || !length ||
++        length > 512 || length > 1024 - offset)
++        return -EINVAL;
++    /* HR_C6000 manual 5.2: addresses auto-increment while CS stays asserted.
++     * MD-UV390 bench: extended reads work at normal SPI speed; ordinary
++     * 8-bit-address reads corrupt the first data bit at that speed.
++     */
++    uint16_t address = 0x30 + offset;
++    uint8_t command[] = {
++        SPI_FLAGS_READ | SPI_FLAGS_EXTD |
++            static_cast<uint8_t>(C6000_SpiOpModes::DATA),
++        static_cast<uint8_t>(address),
++        static_cast<uint8_t>((address >> 8) & 7)
++    };
++    ScopedChipSelect cs(uSpi, uCs);
++    int result = spi_send(uSpi, command, sizeof(command));
++    return result < 0 ? result : spi_receive(uSpi, data, length);
++}
++
++bool HR_C6000::fmRxReady()
++{
++    /* HR_C6000 manual 5.1: CONFIG 0x82 bit 1 is FM received data ready. */
++    constexpr uint8_t fmReady = 0x02;
++    return (readReg16(C6000_SpiOpModes::CONFIG, 0x82) & fmReady) != 0;
++}
++
++void HR_C6000::ackFmRxReady()
++{
++    /* CONFIG 0x83 acknowledges selected interrupt bits; leave others alone. */
++    constexpr uint8_t fmReady = 0x02;
++    writeCfgRegister(0x83, fmReady);
++}
++
++uint8_t HR_C6000::beginFmRxCapture()
++{
++    /* HR_C6000 CONFIG 0x81: a zero bit masks the corresponding event.
++     * Normal UV FM initialization enables only bit 2 (0x04).
++     * Use extended reads because fast ordinary reads corrupt bit 7 here.
++     */
++    constexpr uint8_t fmReady = 0x02;
++    uint8_t saved = readReg16(C6000_SpiOpModes::CONFIG, 0x81);
++    writeCfgRegister(0x81, saved | fmReady);
++    ackFmRxReady();
++    return saved;
++}
++
++void HR_C6000::endFmRxCapture(uint8_t mask)
++{
++    writeCfgRegister(0x81, mask);
++    ackFmRxReady();
++}
+diff --git a/platform/drivers/baseband/HR_C6000.h b/platform/drivers/baseband/HR_C6000.h
+index fda69c4..165a460 100644
+--- a/platform/drivers/baseband/HR_C6000.h
++++ b/platform/drivers/baseband/HR_C6000.h
+@@ -76,6 +76,32 @@ public:
+      */
+     void sendTone(const uint32_t freq, const uint8_t deviation);
+ 
++    /**
++     * Read one 64-byte diagnostic chunk of the two FM receive RAM halves.
++     * This is a live, potentially torn snapshot, not a continuous PCM stream.
++     * No configuration or interrupt acknowledgement registers are written.
++     * @param chunk: 0..15, relative to RX RAM address 0x030.
++     * @param data: destination for 64 bytes.
++     * @param registers: destination for mode, interrupt mask and status bytes.
++     * @return zero on success, negative errno for invalid chunk or non-FM mode.
++     */
++    int readFmRxProbe(uint8_t chunk, uint8_t *data, uint8_t *registers);
++
++    /** Read CONFIG 0x01, 0x10, 0x81, 0xe0 using normal then extended
++     * addressing into eight bytes. Does not write configuration registers.
++     */
++    void readFmProbeRegisters(uint8_t *values);
++    /** Read a bounded region of FM RX RAM using one extended SPI burst. */
++    int readFmRxRam(uint16_t offset, uint8_t *data, size_t length);
++    /** Read FM-ready status using extended addressing (reliable fast read). */
++    bool fmRxReady();
++    /** Enable FM data-ready events, returning the prior interrupt mask. */
++    uint8_t beginFmRxCapture();
++    /** Restore the saved interrupt mask when leaving FM capture. */
++    void endFmRxCapture(uint8_t mask);
++    /** Acknowledge only the FM-ready interrupt; call only during FM capture. */
++    void ackFmRxReady();
++
+ private:
+ 
+     /**
+diff --git a/platform/drivers/baseband/radio_MD3x0.cpp b/platform/drivers/baseband/radio_MD3x0.cpp
+index df8cc9c..e21caed 100644
+--- a/platform/drivers/baseband/radio_MD3x0.cpp
++++ b/platform/drivers/baseband/radio_MD3x0.cpp
+@@ -7,6 +7,9 @@
+ #include "drivers/tones/toneGenerator_MDx.h"
+ #include "interfaces/nvmem.h"
+ #include "interfaces/radio.h"
++#ifdef CONFIG_USB_AUDIO
++#include "interfaces/usb_audio.h"
++#endif
+ #include "peripherals/gpio.h"
+ #include "calibration/calibInfo_MDx.h"
+ #include "drivers/SPI/spi_bitbang.h"
+@@ -221,6 +224,13 @@ void radio_enableRx()
+     radioStatus = RX;
+ }
+ 
++static bool txFromMcu;
++
++void radio_setTxAudioSource(bool fromMcu)
++{
++    txFromMcu = fromMcu;
++}
++
+ void radio_enableTx()
+ {
+     if(config->txDisable == 1) return;
+@@ -236,7 +246,14 @@ void radio_enableTx()
+     SKY73210_setFrequency(&pll, pllFreq, 5);
+ 
+     // Set TX output power, constrain between 1W and 5W.
+-    float power  = static_cast < float >(config->txPower) / 1000.0f;
++    uint32_t requestedPower = config->txPower;
++#ifdef CONFIG_USB_AUDIO
++    if (config->opMode == OPMODE_FM && txFromMcu) {
++        uint32_t override = usbAudio_txPower();
++        if (override) requestedPower = override;
++    }
++#endif
++    float power  = static_cast < float >(requestedPower) / 1000.0f;
+           power  = std::max(std::min(power, 5.0f), 1.0f);
+     float pwrHi  = static_cast< float >(txpwr_hi);
+     float pwrLo  = static_cast< float >(txpwr_lo);
+@@ -247,12 +264,13 @@ void radio_enableTx()
+     {
+         case OPMODE_FM:
+         {
+-            TxAudioSource source = TxAudioSource::MIC;
++            TxAudioSource source = txFromMcu ? TxAudioSource::LINE_IN
++                                               : TxAudioSource::MIC;
+             FmConfig cfg = (config->bandwidth == BW_12_5) ? FmConfig::BW_12p5kHz
+                                                           : FmConfig::BW_25kHz;
+ 
+             // Setup 1750Hz tone, if enabled
+-            if(config->toneEn)
++            if(config->toneEn && !txFromMcu)
+             {
+                 source = TxAudioSource::LINE_IN;    // HR_C5000 audio input is tone generator
+                 C5000.setModFactor(0x1E);           // Set correct modulation factor
+@@ -260,7 +278,7 @@ void radio_enableTx()
+                 toneGen_beepOn(1750.0f, 255, 0);    // Enable 1750Hz tone, always on
+             }
+ 
+-            C5000.startAnalogTx(source, cfg | FmConfig::PREEMPH_EN);
++            C5000.startAnalogTx(source, txFromMcu ? cfg : cfg | FmConfig::PREEMPH_EN);
+         }
+             break;
+ 
+@@ -290,7 +308,7 @@ void radio_disableRtx()
+         toneGen_toneOff();      // Stop CTCSS tone
+ 
+         // Stop 1750Hz tone
+-        if(config->toneEn)
++        if(config->toneEn && !txFromMcu)
+         {
+             toneGen_beepOff();
+             gpio_setMode(BEEP_OUT, INPUT);
+diff --git a/platform/drivers/baseband/radio_UV3x0.cpp b/platform/drivers/baseband/radio_UV3x0.cpp
+index 64b77a9..f4330e3 100644
+--- a/platform/drivers/baseband/radio_UV3x0.cpp
++++ b/platform/drivers/baseband/radio_UV3x0.cpp
+@@ -7,6 +7,9 @@
+ #include "interfaces/delays.h"
+ #include "interfaces/nvmem.h"
+ #include "interfaces/radio.h"
++#ifdef CONFIG_USB_AUDIO
++#include "interfaces/usb_audio.h"
++#endif
+ #include "peripherals/gpio.h"
+ #include "calibration/calibInfo_MDx.h"
+ #include "hwconfig.h"
+@@ -92,6 +95,10 @@ void radio_terminate()
+ 
+ void radio_setOpmode(const enum opmode mode)
+ {
++#ifdef CONFIG_USB_AUDIO
++    // Stop capture before changing chip mode (old FSM disables afterward).
++    usbAudio_setFmRx(false);
++#endif
+     switch(mode)
+     {
+         case OPMODE_FM:
+@@ -173,6 +180,13 @@ void radio_enableRx()
+     radioStatus = RX;
+ }
+ 
++static bool txFromMcu;
++
++void radio_setTxAudioSource(bool fromMcu)
++{
++    txFromMcu = fromMcu;
++}
++
+ void radio_enableTx()
+ {
+     if(config->txDisable == 1) return;
+@@ -186,7 +200,14 @@ void radio_enableTx()
+     at1846s.setFrequency(config->txFrequency);
+ 
+     // Constrain output power between 1W and 5W.
+-    float power  = static_cast < float >(config->txPower) / 1000.0f;
++    uint32_t requestedPower = config->txPower;
++#ifdef CONFIG_USB_AUDIO
++    if (config->opMode == OPMODE_FM && txFromMcu) {
++        uint32_t override = usbAudio_txPower();
++        if (override) requestedPower = override;
++    }
++#endif
++    float power  = static_cast < float >(requestedPower) / 1000.0f;
+           power  = std::max(std::min(power, 5.0f), 1.0f);
+     float pwrHi  = static_cast< float >(txpwr_hi);
+     float pwrLo  = static_cast< float >(txpwr_lo);
+@@ -199,7 +220,8 @@ void radio_enableTx()
+         {
+             FmConfig cfg = (config->bandwidth == BW_12_5) ? FmConfig::BW_12p5kHz
+                                                           : FmConfig::BW_25kHz;
+-            C6000.startAnalogTx(TxAudioSource::MIC, cfg | FmConfig::PREEMPH_EN);
++            C6000.startAnalogTx(txFromMcu ? TxAudioSource::LINE_IN : TxAudioSource::MIC,
++                               txFromMcu ? cfg : cfg | FmConfig::PREEMPH_EN);
+         }
+             break;
+ 
+@@ -238,7 +260,7 @@ void radio_enableTx()
+         at1846s.enableTxCtcss(config->txTone);
+     }
+ 
+-    if (config->toneEn)
++    if (config->toneEn && !txFromMcu)
+     {
+         at1846s.enableTone(17500);
+     }
+diff --git a/platform/targets/MD-UV3x0/hwconfig.c b/platform/targets/MD-UV3x0/hwconfig.c
+index 3be2138..7e36a99 100644
+--- a/platform/targets/MD-UV3x0/hwconfig.c
++++ b/platform/targets/MD-UV3x0/hwconfig.c
+@@ -13,6 +13,7 @@
+ #include "drivers/ADC/adc_stm32.h"
+ #include "drivers/GPS/gps_stm32.h"
+ #include "core/gps.h"
++#include "interfaces/delays.h"
+ 
+ static pthread_mutex_t c6000_mutex;
+ static pthread_mutex_t adcMutex;
+@@ -60,6 +61,32 @@ static uint8_t spiC6000_func(const void *priv, uint8_t value)
+     return incoming;
+ }
+ 
++#ifdef CONFIG_USB_AUDIO
++/* Diagnostic transport: same pinout/clock polarity as spiC6000_func, with
++ * microsecond settling time. Shares the normal bus mutex; never used for TX.
++ */
++static uint8_t spiC6000_probe_func(const void *priv, uint8_t value)
++{
++    (void)priv;
++    uint8_t incoming = 0;
++    for (uint8_t bit = 0; bit < 8; ++bit) {
++        gpio_setPin(DMR_CLK);
++        if (value & 0x80)
++            gpio_setPin(DMR_MOSI);
++        else
++            gpio_clearPin(DMR_MOSI);
++        value <<= 1;
++        delayUs(1);
++        gpio_clearPin(DMR_CLK);
++        delayUs(1);
++        incoming = (incoming << 1) | gpio_readPin(DMR_MISO);
++    }
++    return incoming;
++}
++SPI_CUSTOM_DEVICE_DEFINE(c6000_probe_spi, spiC6000_probe_func, NULL,
++                         &c6000_mutex)
++#endif
++
+ static void gpsEnable(void *priv)
+ {
+     gpio_setPin(GPS_EN);
+diff --git a/platform/targets/MD-UV3x0/hwconfig.h b/platform/targets/MD-UV3x0/hwconfig.h
+index 2ef8dc7..94dd1e9 100644
+--- a/platform/targets/MD-UV3x0/hwconfig.h
++++ b/platform/targets/MD-UV3x0/hwconfig.h
+@@ -28,6 +28,10 @@ enum AdcChannel {
+ 
+ extern const struct gpsDevice gps;
+ extern const struct spiCustomDevice c6000_spi;
++#ifdef CONFIG_USB_AUDIO
++/** Slower read-only diagnostic transport, sharing the C6000 bus mutex. */
++extern const struct spiCustomDevice c6000_probe_spi;
++#endif
+ extern const struct spiDevice nvm_spi;
+ extern const struct Adc adc1;
+ 
+diff --git a/subprojects/packagefiles/tinyusb/meson.build b/subprojects/packagefiles/tinyusb/meson.build
+index 660866a..dfd9e36 100644
+--- a/subprojects/packagefiles/tinyusb/meson.build
++++ b/subprojects/packagefiles/tinyusb/meson.build
+@@ -1,37 +1,10 @@
+ project('tinyusb', 'c')
+-
+-#
+-# HACK
+-# This is a workaround for meson not propagating the include directories of the
+-# main project to the subprojects. To avoid double-inclusion we force the
+-# include paths needed to compile tinyusb and already present in the main
+-# program via GCC compile arguments.
+-#
+-add_project_arguments('-I../platform/mcu/CMSIS/Device/ST/STM32F4xx/Include',
+-                      language : 'c')
+-add_project_arguments('-I../platform/mcu/CMSIS/Include', language : 'c')
+-add_project_arguments('-w', language : 'c')
+-
+-tinyusb_inc = include_directories('openrtx', 'src', 'hw')
+-
+-tinyusb_src = ['src/tusb.c',
+-               'src/device/usbd.c',
+-               'src/common/tusb_fifo.c',
+-               'src/device/usbd_control.c',
+-               'src/class/cdc/cdc_device.c',
+-               'src/portable/st/synopsys/dcd_synopsys.c',
+-               'src/portable/st/stm32_fsdev/dcd_stm32_fsdev.c']
+-
+-# Define CPU type and clock speed via GCC command line arguments               
+-add_project_arguments('-DSTM32F405xx',       language : 'c')
+-add_project_arguments('-DHSE_VALUE=8000000', language : 'c')
+-
+-
+-
+-tinyusb = static_library('tinyusb',
+-                         tinyusb_src,
+-                         include_directories : tinyusb_inc,
+-                         install : false)
+-
+-tinyusb_dep = declare_dependency(include_directories : tinyusb_inc,
+-                                 link_with : tinyusb)
++# Compile sources with each target's CMSIS, OS and feature configuration.
++tinyusb_src = files(
++  'src/tusb.c',
++  'src/device/usbd.c',
++  'src/common/tusb_fifo.c',
++  'src/class/cdc/cdc_device.c',
++  'src/class/audio/audio_device.c',
++  'src/portable/synopsys/dwc2/dwc2_common.c',
++  'src/portable/synopsys/dwc2/dcd_dwc2.c')
+diff --git a/subprojects/tinyusb.wrap b/subprojects/tinyusb.wrap
+index a2a5d39..b78e0d7 100644
+--- a/subprojects/tinyusb.wrap
++++ b/subprojects/tinyusb.wrap
+@@ -1,4 +1,4 @@
+ [wrap-git]
+ url = https://github.com/hathach/tinyusb.git
+-revision = 4bfab30c02279a0530e1a56f4a7c539f2d35a293
++revision = c9e8ac5f4022030d8d66d76f042b3615f234bd61
+ patch_directory = tinyusb
+diff --git a/openrtx/include/core/usb_audio.h b/openrtx/include/core/usb_audio.h
+new file mode 100644
+index 0000000..855fced
+--- /dev/null
++++ b/openrtx/include/core/usb_audio.h
+@@ -0,0 +1,24 @@
++/*
++ * SPDX-FileCopyrightText: Copyright 2026 OpenRTX Contributors
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++#pragma once
++#include "core/audio_stream.h"
++#ifdef __cplusplus
++extern "C" {
++#endif
++/** Allocate and start FM USB playback on an already reserved MCU->RF path. */
++int usbAudioBridge_startTx(pathId path);
++/** Stop the current stream, release an owned capture path and free DMA memory.
++ * All bridge calls belong to the rtx thread.
++ */
++void usbAudioBridge_stop(void);
++/** Service FM audio for one DMA half-buffer (10 ms).
++ * rx: true only during FM reception; tx: true only during USB-sourced FM TX.
++ * Returns true when DMA provided pacing, false when caller should sleep.
++ */
++bool usbAudioBridge_update(bool rx, bool tx);
++#ifdef __cplusplus
++}
++#endif
+diff --git a/openrtx/include/core/usb_control.h b/openrtx/include/core/usb_control.h
+new file mode 100644
+index 0000000..c76acd5
+--- /dev/null
++++ b/openrtx/include/core/usb_control.h
+@@ -0,0 +1,30 @@
++/*
++ * SPDX-FileCopyrightText: Copyright 2026 OpenRTX Contributors
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++#pragma once
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++/** USB PTT request state; access serialized by the USB service mutex. */
++struct usbControl {
++    uint32_t lease; ///< Last valid PTT 1 command time, milliseconds.
++    uint32_t start; ///< Start of this uninterrupted request.
++    bool requested; ///< Request awaiting/held by the FM state machine.
++    bool blocked;   ///< Hard timeout; only PTT 0 clears it.
++};
++/** Expire request on loss of playback/connection, lease or hard timeout. */
++void usbControl_tick(struct usbControl *control, uint32_t now, bool live);
++/** Handle a CTRL payload (no channel/CRC) and return a reply string.
++ * Unsupported commands leave request state unchanged. PTT 1 renews a
++ * one-second lease but never extends the 60-second hard timeout.
++ */
++const char *usbControl_command(struct usbControl *control, uint32_t now,
++                               bool live, const uint8_t *data, size_t length);
++#ifdef __cplusplus
++}
++#endif
+diff --git a/openrtx/include/core/usb_frame.h b/openrtx/include/core/usb_frame.h
+new file mode 100644
+index 0000000..5d00d3f
+--- /dev/null
++++ b/openrtx/include/core/usb_frame.h
+@@ -0,0 +1,26 @@
++/*
++ * SPDX-FileCopyrightText: Copyright 2026 OpenRTX Contributors
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++#pragma once
++#include <stdint.h>
++#include <stddef.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++/** Maximum decoded message including channel, excluding CRC. */
++enum { USB_FRAME_MAX = 240, USB_FRAME_WIRE_MAX = 244 };
++/** Encode channel + payload with CRC-16/XMODEM, COBS and zero delimiter.
++ * Returns encoded length, or zero for an oversized input/output buffer.
++ */
++size_t usbFrame_encode(const uint8_t *data, size_t len, uint8_t *wire,
++                       size_t capacity);
++/** Decode one frame without its delimiter and verify CRC.
++ * Returns message length, or zero for malformed/oversized/corrupt frames.
++ */
++size_t usbFrame_decode(const uint8_t *wire, size_t len, uint8_t *data,
++                       size_t capacity);
++#ifdef __cplusplus
++}
++#endif
+diff --git a/openrtx/include/interfaces/usb_audio.h b/openrtx/include/interfaces/usb_audio.h
+new file mode 100644
+index 0000000..bd8d6f1
+--- /dev/null
++++ b/openrtx/include/interfaces/usb_audio.h
+@@ -0,0 +1,48 @@
++/*
++ * SPDX-FileCopyrightText: Copyright 2026 OpenRTX Contributors
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++#pragma once
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++/** Start the USB service after platform/audio initialization; negative on error. */
++int usbAudio_init(void);
++/** USB FM power override in mW, or zero to use the codeplug channel. */
++uint32_t usbAudio_txPower(void);
++/** Consume a requested global codeplug channel; call only in the UI thread. */
++bool usbAudio_takeChannel(uint16_t *channel);
++/** Complete UI processing of a channel request (failure resets Radio choice). */
++void usbAudio_channelResult(bool success);
++/** Publish the UI's current global channel (-1 for VFO) to USB clients.
++ * Name points to up to 32 bytes; frequencies are in Hz. Call in UI thread.
++ */
++void usbAudio_setChannel(int32_t index, const char *name,
++                         uint32_t rx, uint32_t tx);
++/** Stop and join the USB service before platform shutdown. */
++void usbAudio_terminate(void);
++/** Host playback is active, unmuted and receiving packets. */
++bool usbAudio_playing(void);
++/** Host enabled capture and this hardware has an RF ADC path. */
++bool usbAudio_capturing(void);
++/** Manual or automatic USB PTT is requested; only the FM FSM may act on it. */
++bool usbAudio_ptt(void);
++/** Revoke PTT; automatic mode requires rearming. Used on FM mode exit. */
++void usbAudio_releasePtt(void);
++/** Read an adaptively resampled 480-sample block; silence on underrun. */
++void usbAudio_read(int16_t *samples);
++/** Supply signed capture PCM at 48 kHz. Called only by the FM stream owner. */
++void usbAudio_write(const int16_t *samples, size_t count);
++/** Enable platform receive streaming only while the FM FSM is receiving. */
++void usbAudio_setFmRx(bool active);
++/** Supply current FM RSSI for the independent USB capture squelch gate. */
++void usbAudio_setRxRssi(int32_t rssi);
++/** Tell USB whether an actual RF ADC stream is producing capture data. */
++void usbAudio_setCapture(bool active);
++#ifdef __cplusplus
++}
++#endif
+diff --git a/openrtx/src/core/usb_audio.c b/openrtx/src/core/usb_audio.c
+new file mode 100644
+index 0000000..75b1e85
+--- /dev/null
++++ b/openrtx/src/core/usb_audio.c
+@@ -0,0 +1,100 @@
++/*
++ * SPDX-FileCopyrightText: Copyright 2026 OpenRTX Contributors
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++#include "core/usb_audio.h"
++#include "interfaces/usb_audio.h"
++#include <stdlib.h>
++#include <string.h>
++#include <errno.h>
++
++enum { BLOCK_SAMPLES = 480, DMA_SAMPLES = 2 * BLOCK_SAMPLES };
++static streamId stream = -1;
++static pathId capture_path = -1;
++static int16_t *buffer;
++static bool transmitting;
++
++void usbAudioBridge_stop(void)
++{
++    usbAudio_setFmRx(false);
++    usbAudio_setCapture(false);
++    if (stream >= 0)
++        audioStream_terminate(stream);
++    if (capture_path > 0)
++        audioPath_release(capture_path);
++    stream = -1;
++    capture_path = -1;
++    free(buffer);
++    buffer = NULL;
++    transmitting = false;
++}
++
++int usbAudioBridge_startTx(pathId path)
++{
++    usbAudioBridge_stop();
++    /* Heap is DMA-accessible SRAM; static .bss is inaccessible CCM on MDx. */
++    buffer = calloc(DMA_SAMPLES, sizeof(*buffer));
++    if (buffer == NULL)
++        return -ENOMEM;
++    stream = audioStream_start(path, buffer, DMA_SAMPLES, 48000,
++                               STREAM_OUTPUT | BUF_CIRC_DOUBLE);
++    if (stream < 0) {
++        usbAudioBridge_stop();
++        return -EIO;
++    }
++    transmitting = true;
++    return 0;
++}
++
++bool usbAudioBridge_update(bool rx, bool tx)
++{
++    bool capture = rx && usbAudio_capturing();
++    if (!tx && transmitting)
++        usbAudioBridge_stop();
++    if (!capture && (capture_path > 0))
++        usbAudioBridge_stop();
++    if (capture && (stream < 0)) {
++        capture_path = audioPath_request(SOURCE_RTX, SINK_MCU, PRIO_RX);
++        if (capture_path <= 0)
++            return false;
++        buffer = calloc(DMA_SAMPLES, sizeof(*buffer));
++        if (buffer == NULL) {
++            usbAudioBridge_stop();
++            return false;
++        }
++        stream = audioStream_start(capture_path, buffer, DMA_SAMPLES, 48000,
++                                   STREAM_INPUT | BUF_CIRC_DOUBLE);
++        if (stream < 0) {
++            usbAudioBridge_stop();
++            return false;
++        }
++        usbAudio_setCapture(true);
++    }
++    if (stream < 0)
++        return false;
++    if (tx) {
++        /* Wait for a completed half, fill it, then convert it before DMA reuse. */
++        int16_t *idle = outputStream_getIdleBuffer(stream);
++        if (idle == NULL) {
++            usbAudioBridge_stop();
++            return false;
++        }
++        usbAudio_read(idle);
++        if (!outputStream_sync(stream, true)) {
++            usbAudioBridge_stop();
++            return false;
++        }
++    } else {
++        dataBlock_t block = inputStream_getData(stream);
++        if ((block.data == NULL) || (block.len != BLOCK_SAMPLES)) {
++            usbAudioBridge_stop();
++            return false;
++        }
++        /* STM32 ADC data is unsigned, right-aligned 12-bit. */
++        for (size_t i = 0; i < block.len; ++i)
++            block.data[i] = (int16_t)(((int32_t)block.data[i] - 2048) * 16);
++        usbAudio_write(block.data, block.len);
++    }
++    return true;
++}
+diff --git a/openrtx/src/core/usb_control.c b/openrtx/src/core/usb_control.c
+new file mode 100644
+index 0000000..3406d69
+--- /dev/null
++++ b/openrtx/src/core/usb_control.c
+@@ -0,0 +1,39 @@
++/*
++ * SPDX-FileCopyrightText: Copyright 2026 OpenRTX Contributors
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++#include "core/usb_control.h"
++#include <string.h>
++
++enum { LEASE_MS = 1000, MAX_TX_MS = 60000 };
++
++void usbControl_tick(struct usbControl *control, uint32_t now, bool live)
++{
++    if (control->requested && (now - control->start >= MAX_TX_MS)) {
++        control->blocked = true;
++        control->requested = false;
++    }
++    if (!live || (now - control->lease >= LEASE_MS))
++        control->requested = false;
++}
++
++const char *usbControl_command(struct usbControl *control, uint32_t now,
++                               bool live, const uint8_t *data, size_t length)
++{
++    usbControl_tick(control, now, live);
++    if ((length == 5) && !memcmp(data, "PTT 0", 5)) {
++        control->requested = control->blocked = false;
++        return "OK";
++    }
++    if ((length == 5) && !memcmp(data, "PTT 1", 5)) {
++        if (control->blocked || !live)
++            return "ERR playback inactive or timeout; PTT 0 to reset";
++        if (!control->requested)
++            control->start = now;
++        control->lease = now;
++        control->requested = true;
++        return "OK requested";
++    }
++    return "ERR unsupported";
++}
+diff --git a/openrtx/src/core/usb_frame.c b/openrtx/src/core/usb_frame.c
+new file mode 100644
+index 0000000..94bafb4
+--- /dev/null
++++ b/openrtx/src/core/usb_frame.c
+@@ -0,0 +1,66 @@
++/*
++ * SPDX-FileCopyrightText: Copyright 2026 OpenRTX Contributors
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++#include "core/usb_frame.h"
++#include "core/crc.h"
++#include <string.h>
++
++size_t usbFrame_encode(const uint8_t *data, size_t len, uint8_t *wire,
++                       size_t capacity)
++{
++    if ((len == 0) || (len > USB_FRAME_MAX) || (capacity < len + 4))
++        return 0;
++    uint16_t crc = crc_ccitt(data, len);
++    size_t out = 1, code_pos = 0;
++    uint8_t code = 1;
++    for (size_t i = 0; i < len + 2; ++i) {
++        uint8_t value = i < len ?
++                            data[i] :
++                            (i == len ? (uint8_t)crc : (uint8_t)(crc >> 8));
++        if (value == 0) {
++            wire[code_pos] = code;
++            code_pos = out++;
++            code = 1;
++        } else {
++            wire[out++] = value;
++            ++code;
++        }
++    }
++    wire[code_pos] = code;
++    wire[out++] = 0;
++    return out;
++}
++
++size_t usbFrame_decode(const uint8_t *wire, size_t len, uint8_t *data,
++                       size_t capacity)
++{
++    if ((len < 4) || (len >= USB_FRAME_WIRE_MAX))
++        return 0;
++    uint8_t decoded[USB_FRAME_MAX + 2];
++    size_t in = 0, out = 0;
++    while (in < len) {
++        uint8_t code = wire[in++];
++        if ((code == 0) || (code - 1u > len - in))
++            return 0;
++        for (size_t i = 1; i < code; ++i) {
++            if ((out == sizeof(decoded)) || (wire[in] == 0))
++                return 0;
++            decoded[out++] = wire[in++];
++        }
++        if ((code != 255) && (in < len)) {
++            if (out == sizeof(decoded))
++                return 0;
++            decoded[out++] = 0;
++        }
++    }
++    if ((out < 3) || (out - 2 > capacity))
++        return 0;
++    size_t size = out - 2;
++    uint16_t crc = decoded[size] | ((uint16_t)decoded[size + 1] << 8);
++    if (crc != crc_ccitt(decoded, size))
++        return 0;
++    memcpy(data, decoded, size);
++    return size;
++}
+diff --git a/platform/drivers/USB/tyt/tusb_config.h b/platform/drivers/USB/tyt/tusb_config.h
+new file mode 100644
+index 0000000..8a71940
+--- /dev/null
++++ b/platform/drivers/USB/tyt/tusb_config.h
+@@ -0,0 +1,33 @@
++/*
++ * SPDX-FileCopyrightText: Copyright 2026 OpenRTX Contributors
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++#pragma once
++#define CFG_TUSB_MCU OPT_MCU_STM32F4
++#define CFG_TUSB_OS OPT_OS_NONE
++#define CFG_TUD_ENABLED 1
++#define CFG_TUD_MAX_SPEED OPT_MODE_FULL_SPEED
++#define CFG_TUSB_RHPORT0_MODE (OPT_MODE_DEVICE | OPT_MODE_FULL_SPEED)
++#define CFG_TUD_ENDPOINT0_SIZE 64
++#define CFG_TUD_CDC 1
++#define CFG_TUD_AUDIO 1
++#define CFG_TUD_CDC_RX_BUFSIZE 512
++#define CFG_TUD_CDC_TX_BUFSIZE 512
++#define CFG_TUD_CDC_RX_EPSIZE 64
++#define CFG_TUD_CDC_TX_EPSIZE 64
++#define CFG_TUD_AUDIO_ENABLE_EP_IN 1
++#define CFG_TUD_AUDIO_ENABLE_EP_OUT 1
++#define CFG_TUD_AUDIO_ENABLE_FEEDBACK_EP 0
++#ifdef PLATFORM_MDUV3x0
++#define CONFIG_USB_CAPTURE_RATE 8000
++#define CFG_TUD_AUDIO_FUNC_1_EP_IN_SZ_MAX 18
++#else
++#define CONFIG_USB_CAPTURE_RATE 48000
++#define CFG_TUD_AUDIO_FUNC_1_EP_IN_SZ_MAX 98
++#endif
++#define CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_MAX 98
++#define CFG_TUD_AUDIO_FUNC_1_EP_IN_SW_BUF_SZ 2880
++#define CFG_TUD_AUDIO_FUNC_1_EP_OUT_SW_BUF_SZ 2880
++#define CFG_TUD_AUDIO_EP_IN_FLOW_CONTROL 1
++#define CFG_TUSB_MEM_ALIGN __attribute__((aligned(4)))
+diff --git a/platform/drivers/USB/tyt/usb_composite.cpp b/platform/drivers/USB/tyt/usb_composite.cpp
+new file mode 100644
+index 0000000..aa9f33e
+--- /dev/null
++++ b/platform/drivers/USB/tyt/usb_composite.cpp
+@@ -0,0 +1,759 @@
++/*
++ * SPDX-FileCopyrightText: Copyright 2026 OpenRTX Contributors
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++#include "tusb.h"
++#include "usb_mixer.h"
++#include "usb_rx.h"
++#include <stdlib.h>
++#include "usb_descriptors.h"
++#include "interfaces/cps_io.h"
++#include "interfaces/platform.h"
++#ifdef PLATFORM_MDUV3x0
++#include "hwconfig.h"
++#include "interfaces/radio.h"
++#endif
++#include "stm32f4xx.h"
++#include "peripherals/gpio.h"
++#include "interfaces/delays.h"
++#include "interfaces/usb_audio.h"
++#include "core/usb_frame.h"
++#include "core/usb_control.h"
++#include "core/threads.h"
++#include "drivers/usb_vcom.h"
++#include <pthread.h>
++#include <errno.h>
++#include <stdio.h>
++#include <string.h>
++
++static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
++static pthread_t service;
++static bool running, started, playing, capturing, captureActive;
++static struct usbControl control;
++static bool fmReceiving;
++#ifdef PLATFORM_MDUV3x0
++static struct usbRx *rxStream;
++static bool rxStarted;
++static uint8_t rxSavedMask;
++static uint32_t rxEvents;
++static void stop_fm_capture();
++#endif
++static struct usbMixer mixer = {0, 1, false, false, false, 0, 0, true, 0, 1, false};
++static uint8_t channelCount;
++static char channelStatus[160] = "CHANNEL index=-1 rx=0 tx=0 name=Radio";
++static bool channelEvents, channelDirty;
++static int32_t receiveRssi = -127;
++static volatile uint32_t lastAudio; // Written by audio OUT ISR.
++static uint8_t frame[USB_FRAME_WIRE_MAX];
++static size_t frameSize;
++static bool discard;
++static int16_t resample[481];
++static const int16_t silence[CONFIG_USB_CAPTURE_RATE / 1000] = {};
++enum { AUDIO_TIMEOUT_MS = 100 };
++
++extern "C" uint32_t tusb_time_millis_api(void)
++{
++    return (uint32_t)getTick();
++}
++
++extern "C" void tusb_time_delay_ms_api(uint32_t ms)
++{
++    delayMs(ms);
++}
++
++/* Startup vector in OpenRTX uses the C++-mangled ISR symbol. TinyUSB's ISR
++ * only queues control/CDC events and moves audio FIFO data, never RTOS calls.
++ */
++void OTG_FS_IRQHandler(void)
++{
++    tud_int_handler(0);
++}
++
++int vcom_init()
++{
++    gpio_setMode(GPIOA, 11, ALTERNATE | ALTERNATE_FUNC(10));
++    gpio_setMode(GPIOA, 12, ALTERNATE | ALTERNATE_FUNC(10));
++    gpio_setOutputSpeed(GPIOA, 11, HIGH);
++    gpio_setOutputSpeed(GPIOA, 12, HIGH);
++    RCC->APB2ENR |= RCC_APB2ENR_SYSCFGEN;
++    RCC->AHB2ENR |= RCC_AHB2ENR_OTGFSEN;
++    __DSB();
++    NVIC_ClearPendingIRQ(OTG_FS_IRQn);
++    NVIC_SetPriority(OTG_FS_IRQn, 14);
++    const tusb_rhport_init_t init = { TUSB_ROLE_DEVICE, TUSB_SPEED_FULL };
++    return tusb_init(0, &init) ? 0 : -EIO;
++}
++
++static bool send_frame(uint8_t channel, const void *data, size_t length)
++{
++    if (length >= USB_FRAME_MAX)
++        return false;
++    uint8_t payload[USB_FRAME_MAX], wire[USB_FRAME_WIRE_MAX];
++    payload[0] = channel;
++    memcpy(payload + 1, data, length);
++    size_t size = usbFrame_encode(payload, length + 1, wire, sizeof(wire));
++    if (tud_cdc_write_available() < size)
++        return false;
++    return tud_cdc_write(wire, size) == size;
++}
++
++static void reset_link()
++{
++    playing = capturing = false;
++    channelEvents = false;
++#ifdef PLATFORM_MDUV3x0
++    stop_fm_capture();
++#endif
++    mixer.requested = mixer.blocked = false;
++    mixer.channelPending = false;
++    control.requested = false;
++    frameSize = 0;
++    discard = false;
++    lastAudio = 0;
++}
++
++extern "C" void tud_mount_cb(void)
++{
++    reset_link();
++}
++extern "C" void tud_umount_cb(void)
++{
++    reset_link();
++}
++extern "C" void tud_suspend_cb(bool remote_wakeup_en)
++{
++    (void)remote_wakeup_en;
++    reset_link();
++}
++
++extern "C" void tud_cdc_line_state_cb(uint8_t itf, bool dtr, bool rts)
++{
++    (void)itf;
++    (void)rts;
++    if (!dtr) {
++        channelEvents = false;
++        control.requested = false;
++        frameSize = 0;
++        discard = false;
++    }
++}
++
++extern "C" bool tud_audio_set_itf_cb(uint8_t rhport,
++                                     const tusb_control_request_t *request)
++{
++    (void)rhport;
++    if (request->wValue > 1)
++        return false;
++    if (request->wIndex == 1) {
++        playing = request->wValue == 1;
++        if (!playing)
++            control.requested = false;
++        usbMixer_tick(&mixer, (uint32_t)getTick(), false, false);
++        lastAudio = 0;
++    } else if (request->wIndex == 2) {
++        capturing = request->wValue == 1;
++#ifdef PLATFORM_MDUV3x0
++        stop_fm_capture();
++#endif
++    }
++    return true;
++}
++
++extern "C" bool tud_audio_set_req_entity_cb(
++    uint8_t rhport, const tusb_control_request_t *request, uint8_t *buffer)
++{
++    (void)rhport;
++    if (request->bRequest != 1 ||
++        usbMixer_control(&mixer, request->wIndex, request->wValue,
++                         request->wLength, true, buffer) != 0)
++        return false;
++    usbMixer_squelch(&mixer, receiveRssi);
++    if (mixer.muted || (request->wIndex >> 8) == 7)
++        control.requested = false;
++    return true;
++}
++
++extern "C" bool tud_audio_get_req_entity_cb(
++    uint8_t rhport, const tusb_control_request_t *request)
++{
++    uint8_t value = 0;
++    if (request->bRequest != 0x81 ||
++        usbMixer_control(&mixer, request->wIndex, request->wValue,
++                         request->wLength, false, &value) != 0)
++        return false;
++    return tud_audio_buffer_and_schedule_control_xfer(rhport, request, &value, 1);
++}
++
++extern "C" bool tud_audio_rx_done_isr(uint8_t rhport, uint16_t bytes,
++                                      uint8_t function, uint8_t ep, uint8_t alt)
++{
++    (void)rhport;
++    (void)function;
++    (void)ep;
++    (void)alt;
++    if ((bytes >= 2) && ((bytes & 1) == 0))
++        lastAudio = (uint32_t)getTick();
++    return true;
++}
++
++static bool capture_supported()
++{
++#ifdef PLATFORM_MD3x0
++    return true;
++#else
++    return false;
++#endif
++}
++
++static bool playback_live()
++{
++    return !mixer.muted && playing && (lastAudio != 0) && tud_mounted() && !tud_suspended()
++        && ((uint32_t)getTick() - lastAudio < AUDIO_TIMEOUT_MS);
++}
++
++#ifdef PLATFORM_MDUV3x0
++/* Alternate transport shares GPIOs and the normal SPI mutex. No reinit. */
++static HR_C6000 probeC6000((const struct spiDevice *)&c6000_probe_spi,
++                           {DMR_CS});
++#endif
++
++static void send_rx_registers()
++{
++#ifdef PLATFORM_MDUV3x0
++    if (radio_getStatus() != RX || playback_live() || rxStarted) {
++        const char *error = "ERR probe requires idle reception";
++        send_frame(1, error, strlen(error));
++        return;
++    }
++    uint8_t fast[8], slow[8];
++    C6000.readFmProbeRegisters(fast);
++    probeC6000.readFmProbeRegisters(slow);
++    char response[224];
++    snprintf(response, sizeof(response),
++             "RXREGS order=01,10,81,e0 fast=%02x,%02x,%02x,%02x "
++             "fast_ext=%02x,%02x,%02x,%02x slow=%02x,%02x,%02x,%02x "
++             "slow_ext=%02x,%02x,%02x,%02x",
++             fast[0], fast[1], fast[2], fast[3],
++             fast[4], fast[5], fast[6], fast[7],
++             slow[0], slow[1], slow[2], slow[3],
++             slow[4], slow[5], slow[6], slow[7]);
++    send_frame(1, response, strlen(response));
++#else
++    const char *error = "ERR RXREGS requires MD-UV380/390";
++    send_frame(1, error, strlen(error));
++#endif
++}
++
++/* Bounded read-only diagnostic; only the UV family has C6000 FM RAM. */
++static void send_rx_probe(uint8_t chunk)
++{
++#ifdef PLATFORM_MDUV3x0
++    if (radio_getStatus() != RX || playback_live() || rxStarted) {
++        const char *error = "ERR probe requires idle FM reception";
++        send_frame(1, error, strlen(error));
++        return;
++    }
++    uint8_t data[64], registers[3];
++    uint32_t tick = (uint32_t)getTick();
++    if (probeC6000.readFmRxProbe(chunk, data, registers) < 0) {
++        char error[80];
++        snprintf(error, sizeof(error),
++                 "ERR probe requires FM mode: reg10=%02x (bit7 must be set)",
++                 registers[0]);
++        send_frame(1, error, strlen(error));
++        return;
++    }
++    char response[224];
++    int length = snprintf(response, sizeof(response),
++                          "RXPROBE %02u %lu %lu %02x %02x %02x ", chunk,
++                          (unsigned long)tick, (unsigned long)getTick(),
++                          registers[0], registers[1], registers[2]);
++    const char hex[] = "0123456789abcdef";
++    for (size_t i = 0; i < sizeof(data); ++i) {
++        response[length++] = hex[data[i] >> 4];
++        response[length++] = hex[data[i] & 15];
++    }
++    send_frame(1, response, length);
++#else
++    (void)chunk;
++    const char *error = "ERR RXPROBE requires MD-UV380/390";
++    send_frame(1, error, strlen(error));
++#endif
++}
++
++static void handle_frame()
++{
++    uint8_t payload[USB_FRAME_MAX + 1];
++    size_t size = usbFrame_decode(frame, frameSize, payload, USB_FRAME_MAX);
++    if (size == 0)
++        return;
++    payload[size] = 0;
++    const char *reply = "ERR unsupported";
++    if (payload[0] == 1) {
++        const char *command = (const char *)payload + 1;
++        if (size == 8 && !memcmp(command, "CHANNEL", 7)) {
++            send_frame(1, channelStatus, strlen(channelStatus));
++            return;
++        }
++        if (size == 9 && !memcmp(command, "EVENTS ", 7) &&
++            (command[7] == '0' || command[7] == '1')) {
++            channelEvents = command[7] == '1';
++            channelDirty = true;
++            send_frame(1, "OK", 2);
++            return;
++        }
++        if ((size == 7) && !memcmp(command, "STATUS", 6)) {
++            char status[224];
++            snprintf(
++                status, sizeof(status),
++                "v=1 rate=48000 capture_rate=%u rx=%s playback=%u capture=%u ptt_requested=%u blocked=%u ptt_mode=%s muted=%u auto_ptt=%u",
++                CONFIG_USB_CAPTURE_RATE,
++#ifdef PLATFORM_MDUV3x0
++                rxStream ? "c6000-experimental" : "unavailable",
++#else
++                capture_supported() ? "band-limited" : "unavailable",
++#endif
++                playing,
++                capturing, control.requested, control.blocked,
++                mixer.mode == 2 ? "Always" : "Triggered", mixer.muted,
++                mixer.requested);
++            send_frame(1, status, strlen(status));
++            return;
++        }
++#ifdef PLATFORM_MDUV3x0
++        if (size == 7 && !memcmp(command, "RXDROP", 6)) {
++            char status[224];
++            const struct usbRx empty = {};
++            const struct usbRx *rx = rxStream ? rxStream : &empty;
++            snprintf(status, sizeof(status),
++                     "RXDROP early=%lu ambiguous=%lu unsynced=%lu "
++                     "torn=%lu io=%lu full=%lu next=%d transport=slow",
++                     (unsigned long)rx->early, (unsigned long)rx->ambiguous,
++                     (unsigned long)rx->unsynced, (unsigned long)rx->torn,
++                     (unsigned long)rx->io, (unsigned long)rx->full, rx->next);
++            send_frame(1, status, strlen(status));
++            return;
++        }
++        if (size == 7 && !memcmp(command, "RXSTAT", 6)) {
++            char status[192];
++            snprintf(status, sizeof(status),
++                     "RXSTAT active=%u fm_rx=%u blocks=%lu dropped=%lu "
++                     "underruns=%lu events=%lu queued=%lu",
++                     rxStarted, fmReceiving,
++                     (unsigned long)(rxStream ? rxStream->blocks : 0),
++                     (unsigned long)(rxStream ? rxStream->dropped : 0),
++                     (unsigned long)(rxStream ? rxStream->underruns : 0),
++                     (unsigned long)rxEvents,
++                     (unsigned long)(tud_audio_get_ep_in_ff() ?
++                         tu_fifo_count(tud_audio_get_ep_in_ff()) / 2 : 0));
++            send_frame(1, status, strlen(status));
++            return;
++        }
++#endif
++        if (size == 7 && !memcmp(command, "RXREGS", 6)) {
++            send_rx_registers();
++            return;
++        }
++        if (size == 11 && !memcmp(command, "RXPROBE ", 8) &&
++            command[8] >= '0' && command[8] <= '1' &&
++            command[9] >= '0' && command[9] <= '9') {
++            uint8_t chunk = (command[8] - '0') * 10 + command[9] - '0';
++            if (chunk < 16) {
++                send_rx_probe(chunk);
++                return;
++            }
++        }
++        reply = usbControl_command(&control, (uint32_t)getTick(),
++                                   playback_live() && tud_cdc_connected(),
++                                   payload + 1, size - 1);
++    }
++    send_frame(payload[0], reply, strlen(reply));
++}
++
++#ifdef PLATFORM_MDUV3x0
++static void stop_fm_capture()
++{
++    if (rxStarted) {
++        probeC6000.endFmRxCapture(rxSavedMask);
++        rxStarted = false;
++    }
++}
++
++static bool read_rx_markers(uint8_t *markers)
++{
++    return probeC6000.readFmRxRam(504, markers, 8) == 0 &&
++           probeC6000.readFmRxRam(1016, markers + 8, 8) == 0;
++}
++
++/* USB task owns the stream state; FM mode transitions synchronize on mutex.
++ * Temporarily enable FM-ready events and restore the mask on every exit.
++ */
++static bool service_fm_capture(uint32_t now)
++{
++    if (!rxStream || !capturing || !fmReceiving || !tud_mounted() ||
++        tud_suspended()) {
++        stop_fm_capture();
++        return false;
++    }
++    uint8_t markers[16];
++    if (!rxStarted) {
++        if (!read_rx_markers(markers))
++            return false;
++        usbRx_init(rxStream, markers, now);
++        rxSavedMask = probeC6000.beginFmRxCapture();
++        rxEvents = 0;
++        // Startup latency absorbs 32 ms hardware bursts. TinyUSB's native
++        // async packet sizing handles the independent audio/USB clocks.
++        tud_audio_n_set_ep_in_fifo_threshold(0, 768);
++        int16_t padding[384] = {};
++        tud_audio_write(padding, sizeof(padding));
++        rxStarted = true;
++    } else if (probeC6000.fmRxReady()) {
++        ++rxEvents;
++        // Ack first: an event during the bounded read remains pending.
++        probeC6000.ackFmRxReady();
++        if (read_rx_markers(markers)) {
++            int half = usbRx_select(rxStream, markers, now);
++            if (half >= 0) {
++                uint8_t block[512], check[8];
++                if (probeC6000.readFmRxRam(half * 512, block, sizeof(block)) == 0 &&
++                    probeC6000.readFmRxRam(half * 512 + 504, check, 8) == 0 &&
++                    !memcmp(check, markers + half * 8, 8) &&
++                    !memcmp(block + 504, check, 8)) {
++                    tu_fifo_t *fifo = tud_audio_get_ep_in_ff();
++                    if (fifo && tu_fifo_remaining(fifo) >= sizeof(block)) {
++                        // C6000 signed PCM is big endian; USB PCM is LE.
++                        for (size_t i = 0; i < sizeof(block); i += 2) {
++                            uint8_t byte = block[i];
++                            block[i] = block[i + 1];
++                            block[i + 1] = byte;
++                        }
++                        if (!mixer.squelchOpen)
++                            memset(block, 0, sizeof(block));
++                        tud_audio_write(block, sizeof(block));
++                        ++rxStream->blocks;
++                    } else {
++                        ++rxStream->dropped;
++                        ++rxStream->full;
++                    }
++                } else {
++                    ++rxStream->dropped;
++                    ++rxStream->torn;
++                    rxStream->next = -1;
++                }
++            }
++        } else {
++            ++rxStream->dropped;
++            ++rxStream->io;
++        }
++    }
++    tu_fifo_t *fifo = tud_audio_get_ep_in_ff();
++    if (fifo && tu_fifo_count(fifo) < sizeof(silence) * 2) {
++        tud_audio_write(silence, sizeof(silence));
++        ++rxStream->underruns;
++    }
++    return true;
++}
++#endif
++
++static void *usb_task(void *)
++{
++    while (true) {
++        pthread_mutex_lock(&mutex);
++        if (!running) {
++            pthread_mutex_unlock(&mutex);
++            break;
++        }
++        tud_task_ext(0, false);
++        uint32_t now = (uint32_t)getTick();
++        usbControl_tick(&control, now, playback_live() && tud_cdc_connected());
++        usbMixer_tick(&mixer, now, playing, playback_live());
++        /* Bounded CDC work per tick, so control traffic cannot starve audio. */
++        for (size_t i = 0; (i < 128) && tud_cdc_available(); ++i) {
++            uint8_t byte;
++            if (tud_cdc_read(&byte, 1) != 1)
++                break;
++            if (byte == 0) {
++                if (!discard && frameSize)
++                    handle_frame();
++                frameSize = 0;
++                discard = false;
++            } else if (!discard) {
++                if (frameSize == sizeof(frame))
++                    discard = true;
++                else
++                    frame[frameSize++] = byte;
++            }
++        }
++        bool platformCapture = false;
++#ifdef PLATFORM_MDUV3x0
++        platformCapture = service_fm_capture((uint32_t)getTick());
++#endif
++        /* Silence outside FM reception, including during TX. */
++        if (capturing && !captureActive && !platformCapture) {
++            tu_fifo_t *fifo = tud_audio_get_ep_in_ff();
++            if ((fifo != NULL) && (tu_fifo_count(fifo) < sizeof(silence) * 2))
++                tud_audio_write(silence, sizeof(silence));
++        }
++        if (channelEvents && channelDirty && tud_cdc_connected()) {
++            if (send_frame(2, channelStatus, strlen(channelStatus)))
++                channelDirty = false;
++        }
++        tud_cdc_write_flush();
++        pthread_mutex_unlock(&mutex);
++        sleepFor(0, 1);
++    }
++    return NULL;
++}
++
++int usbAudio_init(void)
++{
++    const hwInfo_t *hw = platform_getHwInfo();
++    usbDescriptors_setModel(hw->name, sizeof(hw->name));
++    // Snapshot channel names once, before servicing enumeration requests.
++    char (*names)[33] = (char (*)[33])calloc(127, 33);
++    if (!names) return -ENOMEM;
++    channel_t channel;
++    for (channelCount = 0; channelCount < 127; ++channelCount) {
++        if (cps_readChannel(&channel, channelCount) < 0) break;
++        strncpy(names[channelCount], channel.name, 32);
++    }
++    mixer.channelCount = channelCount;
++    int descriptors = usbDescriptors_setChannels(names, channelCount);
++    free(names);
++    if (descriptors < 0) return descriptors;
++#ifdef PLATFORM_MDUV3x0
++    rxStream = (struct usbRx *)calloc(1, sizeof(struct usbRx));
++#endif
++
++    pthread_attr_t attr;
++    pthread_attr_init(&attr);
++    pthread_attr_setstacksize(&attr, 4096);
++    struct sched_param param = {};
++    param.sched_priority = THREAD_PRIO_HIGH;
++    pthread_attr_setschedparam(&attr, &param);
++    running = true;
++    int result = pthread_create(&service, &attr, usb_task, NULL);
++    pthread_attr_destroy(&attr);
++    started = result == 0;
++    if (!started) {
++        running = false;
++#ifdef PLATFORM_MDUV3x0
++        free(rxStream);
++        rxStream = NULL;
++#endif
++    }
++    return result == 0 ? 0 : -result;
++}
++
++void usbAudio_terminate(void)
++{
++    if (!started)
++        return;
++    pthread_mutex_lock(&mutex);
++    running = false;
++    control.requested = false;
++#ifdef PLATFORM_MDUV3x0
++    stop_fm_capture();
++#endif
++    pthread_mutex_unlock(&mutex);
++    pthread_join(service, NULL);
++    pthread_mutex_lock(&mutex);
++    tud_deinit(0);
++    pthread_mutex_unlock(&mutex);
++    started = false;
++#ifdef PLATFORM_MDUV3x0
++    free(rxStream);
++    rxStream = NULL;
++#endif
++}
++
++bool usbAudio_playing(void)
++{
++    pthread_mutex_lock(&mutex);
++    bool result = playback_live();
++    pthread_mutex_unlock(&mutex);
++    return result;
++}
++
++bool usbAudio_capturing(void)
++{
++    pthread_mutex_lock(&mutex);
++    bool result = capturing && capture_supported() && tud_mounted();
++    pthread_mutex_unlock(&mutex);
++    return result;
++}
++
++bool usbAudio_ptt(void)
++{
++    pthread_mutex_lock(&mutex);
++    uint32_t now = (uint32_t)getTick();
++    usbControl_tick(&control, now, playback_live() && tud_cdc_connected());
++    usbMixer_tick(&mixer, now, playing, playback_live());
++    bool result = control.requested || mixer.requested;
++    pthread_mutex_unlock(&mutex);
++    return result;
++}
++
++void usbAudio_releasePtt(void)
++{
++    pthread_mutex_lock(&mutex);
++    mixer.requested = false;
++    mixer.blocked = true;
++    control.requested = false;
++    pthread_mutex_unlock(&mutex);
++}
++
++uint32_t usbAudio_txPower(void)
++{
++    pthread_mutex_lock(&mutex);
++    uint32_t power = mixer.power * 1000;
++    pthread_mutex_unlock(&mutex);
++    return power;
++}
++
++bool usbAudio_takeChannel(uint16_t *channel)
++{
++    pthread_mutex_lock(&mutex);
++    bool pending = mixer.channelPending;
++    if (pending) {
++        *channel = mixer.channel - 2;
++        mixer.channelPending = false;
++    }
++    pthread_mutex_unlock(&mutex);
++    return pending;
++}
++
++void usbAudio_channelResult(bool success)
++{
++    pthread_mutex_lock(&mutex);
++    if (!success && !mixer.channelPending) mixer.channel = 1;
++    pthread_mutex_unlock(&mutex);
++}
++
++void usbAudio_setChannel(int32_t index, const char *name,
++                         uint32_t rx, uint32_t tx)
++{
++    char clean[33];
++    size_t length = 0;
++    while (length < 32 && name[length]) {
++        unsigned char value = name[length];
++        clean[length++] = value < 32 ? ' ' : value;
++    }
++    clean[length] = 0;
++    char status[sizeof(channelStatus)];
++    snprintf(status, sizeof(status), "CHANNEL index=%ld rx=%lu tx=%lu name=%s",
++             (long)index, (unsigned long)rx, (unsigned long)tx, clean);
++    pthread_mutex_lock(&mutex);
++    if (strcmp(status, channelStatus)) {
++        strcpy(channelStatus, status);
++        channelDirty = true;
++    }
++    if (!mixer.channelPending)
++        mixer.channel = index >= 0 && index < channelCount ? index + 2 : 1;
++    pthread_mutex_unlock(&mutex);
++}
++
++void usbAudio_setFmRx(bool active)
++{
++    pthread_mutex_lock(&mutex);
++    if (fmReceiving != active) {
++        fmReceiving = active;
++#ifdef PLATFORM_MDUV3x0
++        stop_fm_capture();
++        // Flush old FM samples before TX or a mode transition.
++        NVIC_DisableIRQ(OTG_FS_IRQn);
++        tud_audio_clear_ep_in_ff();
++        NVIC_EnableIRQ(OTG_FS_IRQn);
++#endif
++    }
++    pthread_mutex_unlock(&mutex);
++}
++
++void usbAudio_setRxRssi(int32_t rssi)
++{
++    pthread_mutex_lock(&mutex);
++    receiveRssi = rssi;
++    usbMixer_squelch(&mixer, rssi);
++    pthread_mutex_unlock(&mutex);
++}
++
++void usbAudio_setCapture(bool active)
++{
++    pthread_mutex_lock(&mutex);
++    captureActive = active;
++    /* Resetting a FIFO races the audio ISR; mask only this IRQ briefly. */
++    NVIC_DisableIRQ(OTG_FS_IRQn);
++    tud_audio_clear_ep_in_ff();
++    NVIC_EnableIRQ(OTG_FS_IRQn);
++    pthread_mutex_unlock(&mutex);
++}
++
++void usbAudio_read(int16_t *samples)
++{
++    pthread_mutex_lock(&mutex);
++    /* Consume 479/480/481 samples per DMA half to correct crystal drift.
++     * Linear interpolation spreads the correction across the whole 10 ms.
++     * Keep about 10 ms queued, leaving room for the next 10 ms arrival.
++     */
++    size_t available = tud_audio_available() / 2;
++    size_t count = available > 1008 ? 481 : (available < 912 ? 479 : 480);
++    if (!playback_live() || (available < count)) {
++        memset(samples, 0, 480 * sizeof(*samples));
++    } else {
++        count = tud_audio_read(resample, count * 2) / 2;
++        for (size_t i = 0; i < 480; ++i) {
++            size_t phase = i * (count - 1);
++            size_t index = phase / 479;
++            int32_t a = resample[index];
++            int32_t b = resample[index < count - 1 ? index + 1 : index];
++            samples[i] = a + (b - a) * (int32_t)(phase % 479) / 479;
++        }
++    }
++    pthread_mutex_unlock(&mutex);
++}
++
++void usbAudio_write(const int16_t *samples, size_t count)
++{
++    pthread_mutex_lock(&mutex);
++    if (captureActive && capturing) {
++        if (mixer.squelchOpen) {
++            tud_audio_write(samples, count * 2);
++        } else {
++            while (count) {
++                size_t chunk = count < sizeof(silence) / 2 ?
++                    count : sizeof(silence) / 2;
++                tud_audio_write(silence, chunk * 2);
++                count -= chunk;
++            }
++        }
++    }
++    pthread_mutex_unlock(&mutex);
++}
++
++/* Existing printf producers become LOG frames. The framed CDC parser owns RX;
++ * raw XMODEM is deliberately unavailable in this opt-in configuration.
++ */
++ssize_t vcom_writeBlock(const void *data, size_t length)
++{
++    pthread_mutex_lock(&mutex);
++    size_t written = 0;
++    while (written < length) {
++        size_t size = length - written;
++        if (size >= USB_FRAME_MAX)
++            size = USB_FRAME_MAX - 1;
++        if (!send_frame(5, (const uint8_t *)data + written, size))
++            break;
++        written += size;
++    }
++    pthread_mutex_unlock(&mutex);
++    return written;
++}
++
++ssize_t vcom_readBlock(void *data, size_t length)
++{
++    (void)data;
++    (void)length;
++    return -ENOTSUP;
++}
+diff --git a/platform/drivers/USB/tyt/usb_descriptors.c b/platform/drivers/USB/tyt/usb_descriptors.c
+new file mode 100644
+index 0000000..1454e55
+--- /dev/null
++++ b/platform/drivers/USB/tyt/usb_descriptors.c
+@@ -0,0 +1,242 @@
++/*
++ * SPDX-FileCopyrightText: Copyright 2026 OpenRTX Contributors
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++#include "tusb.h"
++#include "usb_descriptors.h"
++#include <string.h>
++#include <stdlib.h>
++#include <errno.h>
++
++#ifdef PLATFORM_MDUV3x0
++static char product[33] = "Tytera MD-UV380/390";
++#else
++static char product[33] = "Tytera MD-380/390";
++#endif
++
++void usbDescriptors_setModel(const char *name, size_t size)
++{
++    size_t length = 0;
++    while (length < size && name[length] != '\0') {
++        if (name[length] < 32 || name[length] > 126)
++            return;
++        ++length;
++    }
++    while (length && name[length - 1] == ' ')
++        --length;
++    if (!length || length > sizeof(product) - sizeof("Tytera "))
++        return;
++    memcpy(product, "Tytera ", 7);
++    memcpy(product + 7, name, length);
++    product[7 + length] = '\0';
++}
++
++/* Retain OpenRTX's development VID/PID. Obtain an allocation before shipping. */
++static const tusb_desc_device_t device = {
++    .bLength = sizeof(tusb_desc_device_t),
++    .bDescriptorType = TUSB_DESC_DEVICE,
++    .bcdUSB = 0x0200,
++    .bDeviceClass = TUSB_CLASS_MISC,
++    .bDeviceSubClass = MISC_SUBCLASS_COMMON,
++    .bDeviceProtocol = MISC_PROTOCOL_IAD,
++    .bMaxPacketSize0 = 64,
++    .idVendor = 0x0483,
++    .idProduct = 0x5740,
++    .bcdDevice = 0x0204,
++    .iManufacturer = 1,
++    .iProduct = 2,
++    .iSerialNumber = 3,
++    .bNumConfigurations = 1,
++};
++
++/* USB Audio 1.0 sections 4.3-4.6. Named PTT paths and playback master mute.
++ * STM32F405 OTG_FS: EP0 plus three IN and three OUT endpoint numbers.
++ * Audio 01/81, CDC bulk 02/82, CDC notification 83. No feedback endpoint.
++ */
++enum {
++    AUDIO_LENGTH = 68 + 134 + 31 + 8 + 9 + 10 + 2 * (12 + 9) + 2 * (9 + 9 + 7 + 11 + 9 + 7),
++    CONFIG_LENGTH = TUD_CONFIG_DESC_LEN + AUDIO_LENGTH + TUD_CDC_DESC_LEN
++};
++static const uint8_t configuration[] = {
++    TUD_CONFIG_DESCRIPTOR(1, 5, 0, CONFIG_LENGTH,
++                          TUSB_DESC_CONFIG_ATT_SELF_POWERED, 0),
++    8,
++    TUSB_DESC_INTERFACE_ASSOCIATION,
++    0,
++    3,
++    TUSB_CLASS_AUDIO,
++    0,
++    0,
++    4,
++    TUD_AUDIO10_DESC_STD_AC(0, 0, 4),
++    TUD_AUDIO10_DESC_CS_AC(0x0100, 275, 1, 2),
++    TUD_AUDIO10_DESC_INPUT_TERM(1, AUDIO_TERM_TYPE_USB_STREAMING, 0, 1, 0, 0,
++                                0),
++    /* UAC1 section 4.3.2.4: single-pin units name the two logical paths.
++     * Both share one streaming terminal; no extra endpoints are consumed. */
++    7, 0x24, 5, 5, 1, 1, 6,
++    7, 0x24, 5, 6, 1, 1, 7,
++    8, 0x24, 5, 7, 2, 5, 6, 8,
++    /* Feature unit: master mute, no per-channel controls. */
++    9, 0x24, 6, 8, 7, 1, 1, 0, 9,
++    /* TX power: Channel default, then calibrated 1..5 W requests. */
++    7, 0x24, 5, 27, 1, 8, 27,
++    7, 0x24, 5, 28, 1, 8, 28,
++    7, 0x24, 5, 29, 1, 8, 29,
++    7, 0x24, 5, 30, 1, 8, 30,
++    7, 0x24, 5, 31, 1, 8, 31,
++    7, 0x24, 5, 32, 1, 8, 32,
++    12, 0x24, 5, 33, 6, 27, 28, 29, 30, 31, 32, 33,
++    /* Replaced at startup with the codeplug channel catalog. */
++    7, 0x24, 5, 34, 1, 33, 34,
++    7, 0x24, 5, 162, 1, 34, 162,
++    TUD_AUDIO10_DESC_OUTPUT_TERM(2, AUDIO_TERM_TYPE_OUT_GENERIC_SPEAKER, 0, 162,
++                                 0),
++    TUD_AUDIO10_DESC_INPUT_TERM(3, AUDIO_TERM_TYPE_IN_GENERIC_MIC, 0, 1, 0, 0,
++                                0),
++    /* Named capture paths: Off and levels 1..15, all sharing RF input. */
++    7, 0x24, 5, 10, 1, 3, 10,
++    7, 0x24, 5, 11, 1, 3, 11,
++    7, 0x24, 5, 12, 1, 3, 12,
++    7, 0x24, 5, 13, 1, 3, 13,
++    7, 0x24, 5, 14, 1, 3, 14,
++    7, 0x24, 5, 15, 1, 3, 15,
++    7, 0x24, 5, 16, 1, 3, 16,
++    7, 0x24, 5, 17, 1, 3, 17,
++    7, 0x24, 5, 18, 1, 3, 18,
++    7, 0x24, 5, 19, 1, 3, 19,
++    7, 0x24, 5, 20, 1, 3, 20,
++    7, 0x24, 5, 21, 1, 3, 21,
++    7, 0x24, 5, 22, 1, 3, 22,
++    7, 0x24, 5, 23, 1, 3, 23,
++    7, 0x24, 5, 24, 1, 3, 24,
++    7, 0x24, 5, 25, 1, 3, 25,
++    22, 0x24, 5, 26, 16,
++    10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
++    TUD_AUDIO10_DESC_OUTPUT_TERM(4, AUDIO_TERM_TYPE_USB_STREAMING, 0, 26, 0),
++    TUD_AUDIO10_DESC_STD_AS_INT(1, 0, 0, 4),
++    TUD_AUDIO10_DESC_STD_AS_INT(1, 1, 1, 4),
++    TUD_AUDIO10_DESC_CS_AS_INT(1, 1, AUDIO10_DATA_FORMAT_TYPE_I_PCM),
++    TUD_AUDIO10_DESC_TYPE_I_FORMAT(1, 2, 16, 48000),
++    TUD_AUDIO10_DESC_STD_AS_ISO_EP(
++        0x01, TUSB_XFER_ISOCHRONOUS | TUSB_ISO_EP_ATT_ADAPTIVE, 98, 1, 0),
++    TUD_AUDIO10_DESC_CS_AS_ISO_EP(0, 0, 0),
++    TUD_AUDIO10_DESC_STD_AS_INT(2, 0, 0, 4),
++    TUD_AUDIO10_DESC_STD_AS_INT(2, 1, 1, 4),
++    TUD_AUDIO10_DESC_CS_AS_INT(4, 1, AUDIO10_DATA_FORMAT_TYPE_I_PCM),
++    TUD_AUDIO10_DESC_TYPE_I_FORMAT(1, 2, 16, CONFIG_USB_CAPTURE_RATE),
++    TUD_AUDIO10_DESC_STD_AS_ISO_EP(
++        0x81, TUSB_XFER_ISOCHRONOUS | TUSB_ISO_EP_ATT_ASYNCHRONOUS,
++        CFG_TUD_AUDIO_FUNC_1_EP_IN_SZ_MAX, 1, 0),
++    TUD_AUDIO10_DESC_CS_AS_ISO_EP(0, 0, 0),
++    TUD_CDC_DESCRIPTOR(3, 5, 0x83, 8, 0x02, 0x82, 64),
++};
++TU_VERIFY_STATIC(sizeof(configuration) == CONFIG_LENGTH, "USB descriptor size");
++
++static uint8_t *channelConfiguration;
++static char (*channelNames)[33];
++static size_t channelCount;
++
++int usbDescriptors_setChannels(const char (*names)[33], size_t count)
++{
++    if (count > 127 || (count && !names)) return -EINVAL;
++    size_t extra = count * 8;
++    uint8_t *config = malloc(sizeof(configuration) + extra);
++    char (*labels)[33] = count ? malloc(count * 33) : NULL;
++    if (!config || (count && !labels)) {
++        free(config);
++        free(labels);
++        return -ENOMEM;
++    }
++    if (count) memcpy(labels, names, count * 33);
++    for (size_t i = 0; i < count; ++i) labels[i][32] = 0;
++    size_t written = 0;
++    for (size_t pos = 0; pos < sizeof(configuration);) {
++        const uint8_t *d = configuration + pos;
++        if (d[1] == 0x24 && d[2] == 5 && d[3] == 34) {
++            for (size_t i = 0; i <= count; ++i) {
++                const uint8_t unit[] = {7, 0x24, 5, 34 + i, 1, 33, 34 + i};
++                memcpy(config + written, unit, sizeof(unit));
++                written += sizeof(unit);
++            }
++        } else if (d[1] == 0x24 && d[2] == 5 && d[3] == 162) {
++            const uint8_t selector[] = {7 + count, 0x24, 5, 162, 1 + count};
++            memcpy(config + written, selector, sizeof(selector));
++            written += sizeof(selector);
++            for (size_t i = 0; i <= count; ++i) config[written++] = 34 + i;
++            config[written++] = 162;
++        } else {
++            memcpy(config + written, d, d[0]);
++            if (d[1] == 0x24 && d[2] == 1 && d[0] == 10) {
++                uint16_t size = d[5] + (d[6] << 8) + extra;
++                config[written + 5] = size;
++                config[written + 6] = size >> 8;
++            }
++            written += d[0];
++        }
++        pos += d[0];
++    }
++    config[2] = written;
++    config[3] = written >> 8;
++    free(channelConfiguration);
++    free(channelNames);
++    channelConfiguration = config;
++    channelNames = labels;
++    channelCount = count;
++    return 0;
++}
++
++uint8_t const *tud_descriptor_device_cb(void)
++{
++    return (const uint8_t *)&device;
++}
++
++uint8_t const *tud_descriptor_configuration_cb(uint8_t index)
++{
++    return index == 0 ? (channelConfiguration ? channelConfiguration :
++                        configuration) : NULL;
++}
++
++uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid)
++{
++    (void)langid;
++    static uint16_t text[33];
++    static const char *const strings[] = {
++        "", "TYT (Tytera)",
++        product,
++        "", "Radio audio", "Radio control",
++        "Triggered", "Always", "PTT Mode", "Radio",
++        "Off", "1", "2", "3", "4", "5", "6", "7", "8",
++        "9", "10", "11", "12", "13", "14", "15", "Squelch",
++        "Channel", "1 W", "2 W", "3 W", "4 W", "5 W", "TX Power", "Radio",
++    };
++    if (index == 0) {
++        text[0] = (TUSB_DESC_STRING << 8) | 4;
++        text[1] = 0x0409;
++        return text;
++    }
++    const char *label = NULL;
++    if (index < sizeof(strings) / sizeof(strings[0])) label = strings[index];
++    else if (index >= 35 && index < 35 + channelCount)
++        label = channelNames[index - 35];
++    else if (index == 162) label = "RF Channel";
++    else return NULL;
++    size_t length;
++    if (index == 3) {
++        /* STM32F405 unique device ID, RM0090 section 39.1. */
++        const uint8_t *uid = (const uint8_t *)0x1fff7a10;
++        const char hex[] = "0123456789ABCDEF";
++        length = 24;
++        for (size_t i = 0; i < 12; ++i) {
++            text[1 + 2 * i] = hex[uid[i] >> 4];
++            text[2 + 2 * i] = hex[uid[i] & 15];
++        }
++    } else {
++        length = strlen(label);
++        for (size_t i = 0; i < length; ++i)
++            text[i + 1] = label[i];
++    }
++    text[0] = (TUSB_DESC_STRING << 8) | (2 * length + 2);
++    return text;
++}
+diff --git a/platform/drivers/USB/tyt/usb_descriptors.h b/platform/drivers/USB/tyt/usb_descriptors.h
+new file mode 100644
+index 0000000..f47c6a5
+--- /dev/null
++++ b/platform/drivers/USB/tyt/usb_descriptors.h
+@@ -0,0 +1,24 @@
++/*
++ * SPDX-FileCopyrightText: Copyright 2026 OpenRTX Contributors
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++#ifndef USB_DESCRIPTORS_H
++#define USB_DESCRIPTORS_H
++#include <stddef.h>
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++/** Set the factory model name before servicing enumeration requests.
++ * Invalid or empty names retain the compile-time model family fallback.
++ */
++void usbDescriptors_setModel(const char *name, size_t size);
++/** Build the playback channel selector before USB enumeration. Names have
++ * 33-byte stride; up to 127 codeplug channels plus a Radio/keep-current entry.
++ * Returns zero or negative errno; caller may release names afterward.
++ */
++int usbDescriptors_setChannels(const char (*names)[33], size_t count);
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/platform/drivers/USB/tyt/usb_mixer.c b/platform/drivers/USB/tyt/usb_mixer.c
+new file mode 100644
+index 0000000..3cd320a
+--- /dev/null
++++ b/platform/drivers/USB/tyt/usb_mixer.c
+@@ -0,0 +1,109 @@
++/*
++ * SPDX-FileCopyrightText: Copyright 2026 OpenRTX Contributors
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++#include "usb_mixer.h"
++#include <errno.h>
++
++int usbMixer_control(struct usbMixer *state, uint16_t index, uint16_t selector,
++                     uint16_t length, bool write, uint8_t *value)
++{
++    if ((index & 255) || length != 1)
++        return -EINVAL;
++    unsigned entity = index >> 8;
++    if ((entity == 5 || entity == 6 || (entity >= 10 && entity <= 25) || (entity >= 27 && entity <= 32)) && selector == 0) {
++        if (write && *value != 1)
++            return -EINVAL;
++        *value = 1;
++        return 0;
++    }
++    if (selector == 0 && entity >= 34 && entity <= 34u + state->channelCount) {
++        if (write && *value != 1) return -EINVAL;
++        *value = 1;
++        return 0;
++    }
++    if (entity == 162 && selector == 0) {
++        if (write) {
++            if (*value < 1 || *value > state->channelCount + 1) return -EINVAL;
++            state->channel = *value;
++            state->channelPending = *value > 1;
++        } else *value = state->channel;
++        return 0;
++    }
++    if (entity == 33 && selector == 0) {
++        if (write) {
++            if (*value < 1 || *value > 6) return -EINVAL;
++            state->power = *value - 1;
++        } else *value = state->power + 1;
++        return 0;
++    }
++    if (entity == 26 && selector == 0) {
++        if (write) {
++            if (*value < 1 || *value > 16)
++                return -EINVAL;
++            if (state->squelch != *value - 1) {
++                state->squelch = *value - 1;
++                state->squelchOpen = state->squelch == 0;
++            }
++        } else {
++            *value = state->squelch + 1;
++        }
++        return 0;
++    }
++    if (entity == 7 && selector == 0) {
++        if (write) {
++            if (*value < 1 || *value > 2)
++                return -EINVAL;
++            if (state->mode != *value) {
++                state->requested = state->blocked = false;
++                state->mode = *value;
++            }
++        } else {
++            *value = state->mode;
++        }
++        return 0;
++    }
++    if (entity == 8 && selector == 0x0100) {
++        if (write) {
++            if (*value > 1)
++                return -EINVAL;
++            state->muted = *value;
++            if (state->muted)
++                state->requested = state->blocked = false;
++        } else {
++            *value = state->muted;
++        }
++        return 0;
++    }
++    return -EINVAL;
++}
++
++void usbMixer_tick(struct usbMixer *state, uint32_t now, bool playing, bool live)
++{
++    if (state->mode != 2 || state->muted || !playing) {
++        state->requested = state->blocked = false;
++        return;
++    }
++    if (state->requested && (!live || now - state->start >= 60000)) {
++        state->requested = false;
++        state->blocked = true;
++    }
++    if (live && !state->blocked && !state->requested) {
++        state->start = now;
++        state->requested = true;
++    }
++}
++
++void usbMixer_squelch(struct usbMixer *state, int32_t rssi)
++{
++    if (state->squelch == 0) {
++        state->squelchOpen = true;
++        return;
++    }
++    /* Same level-to-RSSI mapping and hysteresis as OpMode_FM. */
++    int32_t threshold = -127 + state->squelch * 66 / 15;
++    if (!state->squelchOpen && rssi > threshold + 1)
++        state->squelchOpen = true;
++    if (state->squelchOpen && rssi < threshold - 1)
++        state->squelchOpen = false;
++}
+diff --git a/platform/drivers/USB/tyt/usb_mixer.h b/platform/drivers/USB/tyt/usb_mixer.h
+new file mode 100644
+index 0000000..d6823ba
+--- /dev/null
++++ b/platform/drivers/USB/tyt/usb_mixer.h
+@@ -0,0 +1,35 @@
++/*
++ * SPDX-FileCopyrightText: Copyright 2026 OpenRTX Contributors
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++#ifndef USB_MIXER_H
++#define USB_MIXER_H
++#include <stdbool.h>
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++struct usbMixer {
++    uint32_t start; ///< Automatic transmission start tick.
++    uint8_t mode; ///< Selector pin: 1 Triggered, 2 Always.
++    bool muted; ///< Playback master mute.
++    bool requested; ///< Automatic PTT request.
++    bool blocked; ///< Requires stop, mute or mode change to rearm.
++    uint8_t squelch; ///< USB capture threshold: 0 Off, 1..15.
++    uint8_t power; ///< 0 Channel, 1..5 requested watts.
++    bool squelchOpen; ///< RSSI gate with one dB hysteresis.
++    uint8_t channelCount; ///< Number of codeplug entries exposed (max 127).
++    uint8_t channel; ///< Selector pin, 1 keeps current radio settings.
++    bool channelPending; ///< UI must consume this selection outside TX.
++};
++/** Read or write a UAC1 entity control. Returns negative errno on rejection. */
++int usbMixer_control(struct usbMixer *state, uint16_t index, uint16_t selector,
++                     uint16_t length, bool write, uint8_t *value);
++/** Update automatic PTT, including packet-loss release and 60-second limit. */
++void usbMixer_tick(struct usbMixer *state, uint32_t now, bool playing, bool live);
++/** Update the USB capture RSSI gate using OpenRTX level mapping. */
++void usbMixer_squelch(struct usbMixer *state, int32_t rssi);
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/platform/drivers/USB/tyt/usb_rx.c b/platform/drivers/USB/tyt/usb_rx.c
+new file mode 100644
+index 0000000..aa0882a
+--- /dev/null
++++ b/platform/drivers/USB/tyt/usb_rx.c
+@@ -0,0 +1,49 @@
++/*
++ * SPDX-FileCopyrightText: Copyright 2026 OpenRTX Contributors
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++#include "usb_rx.h"
++#include <string.h>
++
++void usbRx_init(struct usbRx *s, const uint8_t *markers, uint32_t now)
++{
++    memset(s, 0, sizeof(*s));
++    memcpy(s->markers, markers, 16);
++    s->last = now;
++    s->next = -1;
++}
++
++int usbRx_select(struct usbRx *s, const uint8_t *markers, uint32_t now)
++{
++    uint32_t elapsed = now - s->last;
++    /* Ignore premature notifications without advancing the marker baseline.
++     * Otherwise a run of early events can keep us permanently out of sync.
++     */
++    if (elapsed < 16) {
++        ++s->early;
++        ++s->dropped;
++        return -1;
++    }
++    bool a = memcmp(s->markers, markers, 8) != 0;
++    bool b = memcmp(s->markers + 8, markers + 8, 8) != 0;
++    memcpy(s->markers, markers, 16);
++    s->last = now;
++    if (a && b) {
++        s->next = -1;
++        ++s->ambiguous;
++        ++s->dropped;
++        return -1;
++    }
++    /* A uniquely changed half re-establishes ownership after a scheduling
++     * gap. Timing alone may only choose a half while alternation is locked.
++     */
++    int half = a != b ? (b ? 1 : 0) : (elapsed <= 48 ? s->next : -1);
++    if (half < 0) {
++        s->next = -1;
++        ++s->unsynced;
++        ++s->dropped;
++        return -1;
++    }
++    s->next = 1 - half;
++    return half;
++}
+diff --git a/platform/drivers/USB/tyt/usb_rx.h b/platform/drivers/USB/tyt/usb_rx.h
+new file mode 100644
+index 0000000..bd5b6a9
+--- /dev/null
++++ b/platform/drivers/USB/tyt/usb_rx.h
+@@ -0,0 +1,25 @@
++/*
++ * SPDX-FileCopyrightText: Copyright 2026 OpenRTX Contributors
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++#pragma once
++#include <stdbool.h>
++#include <stdint.h>
++#include <stddef.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++struct usbRx {
++    uint32_t dropped, underruns, blocks; ///< Capture diagnostic counters.
++    uint32_t last; ///< Last observed ready event, milliseconds.
++    uint8_t markers[16]; ///< Last eight bytes of each hardware half.
++    uint32_t early, ambiguous, unsynced, torn, io, full; ///< Drop reasons.
++    int next; ///< Expected half, -1 before synchronization.
++};
++/** Initialize stream state and remember RAM markers before clearing stale IRQ. */
++void usbRx_init(struct usbRx *state, const uint8_t *markers, uint32_t now);
++/** Select completed half on a data-ready event; -1 means uncertain, skip it. */
++int usbRx_select(struct usbRx *state, const uint8_t *markers, uint32_t now);
++#ifdef __cplusplus
++}
++#endif

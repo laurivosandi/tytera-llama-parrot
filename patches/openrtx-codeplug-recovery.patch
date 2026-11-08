@@ -1,0 +1,527 @@
+diff --git a/meson.build b/meson.build
+index fc5581d..eb555bf 100644
+--- a/meson.build
++++ b/meson.build
+@@ -418,7 +418,7 @@ endif
+ ##
+ ## TYT MD-3x0 family
+ ##
+-md3x0_src = ['platform/drivers/CPS/cps_io_native_MD3x0.c',
++md3x0_src = ['platform/drivers/CPS/cps_io_native_tyt.c',
+              'platform/drivers/baseband/SKY72310.c',
+              'platform/drivers/baseband/radio_MD3x0.cpp',
+              'platform/drivers/baseband/HR_C5000_MDx.cpp',
+@@ -431,7 +431,7 @@ md3x0_src = ['platform/drivers/CPS/cps_io_native_MD3x0.c',
+              'platform/targets/MD-3x0/hwconfig.c']
+ 
+ md3x0_inc = ['platform/targets/MD-3x0']
+-md3x0_def = {'PLATFORM_MD3x0': '', 'timegm': 'mktime'}
++md3x0_def = {'CONFIG_TYT_CPS': '', 'PLATFORM_MD3x0': '', 'timegm': 'mktime'}
+ 
+ md3x0_src += openrtx_src + stm32f405_src + ui_src_default + mdx_src
+ md3x0_inc += openrtx_inc + stm32f405_inc
+@@ -440,7 +440,7 @@ md3x0_def += openrtx_def + stm32f405_def
+ ##
+ ## TYT MD-UV380
+ ##
+-mduv3x0_src = ['platform/drivers/CPS/cps_io_native_MDUV3x0.c',
++mduv3x0_src = ['platform/drivers/CPS/cps_io_native_tyt.c',
+                'platform/targets/MD-UV3x0/platform.c',
+                'platform/targets/MD-UV3x0/hwconfig.c',
+                'platform/drivers/GPS/gps_stm32.cpp',
+@@ -455,7 +455,7 @@ mduv3x0_src = ['platform/drivers/CPS/cps_io_native_MDUV3x0.c',
+                'platform/drivers/baseband/HR_C6000_UV3x0.cpp']
+ 
+ mduv3x0_inc = ['platform/targets/MD-UV3x0']
+-mduv3x0_def =  {'PLATFORM_MDUV3x0': '', 'timegm': 'mktime'}
++mduv3x0_def =  {'CONFIG_TYT_CPS': '', 'PLATFORM_MDUV3x0': '', 'timegm': 'mktime'}
+ 
+ mduv3x0_src += openrtx_src + stm32f405_src + ui_src_default + mdx_src
+ mduv3x0_inc += openrtx_inc + stm32f405_inc
+@@ -596,7 +596,7 @@ cs7000p_def += openrtx_def + stm32h743_def + miosix_cm7_def
+ dm1701_src = ['platform/targets/DM-1701/platform.c',
+               'platform/targets/DM-1701/hwconfig.c',
+               'platform/drivers/keyboard/keyboard_DM1701.c',
+-              'platform/drivers/CPS/cps_io_native_MDUV3x0.c',
++              'platform/drivers/CPS/cps_io_native_tyt.c',
+               'platform/drivers/display/HX8353_MD3x.cpp',
+               'platform/drivers/backlight/backlight_MDx.c',
+               'platform/drivers/chSelector/chSelector_UV3x0.c',
+diff --git a/openrtx/include/interfaces/cps_io.h b/openrtx/include/interfaces/cps_io.h
+index 6395e9e..c21ec5b 100644
+--- a/openrtx/include/interfaces/cps_io.h
++++ b/openrtx/include/interfaces/cps_io.h
+@@ -26,6 +26,11 @@ extern "C" {
+  */
+ int cps_open(char *cps_name);
+ 
++/** True when the TYT reader is serving fallback channels from RAM.
++ * Available on CONFIG_TYT_CPS targets after cps_open().
++ */
++bool cps_fallbackActive(void);
++
+ /**
+  * Close a codeplug.
+  */
+diff --git a/openrtx/src/core/openrtx.c b/openrtx/src/core/openrtx.c
+index 49f3983..9bac976 100644
+--- a/openrtx/src/core/openrtx.c
++++ b/openrtx/src/core/openrtx.c
+@@ -28,14 +28,6 @@ void openrtx_init()
+     platform_init();    // Initialize low-level platform drivers
+     state_init();       // Initialize radio state
+ 
+-    gfx_init();         // Initialize display and graphics driver
+-    kbd_init();         // Initialize keyboard driver
+-    ui_init();          // Initialize user interface
+-    vp_init();          // Initialize voice prompts
+-    #ifdef CONFIG_SCREEN_CONTRAST
+-    display_setContrast(state.settings.contrast);
+-    #endif
+-
+     // Load codeplug from nonvolatile memory, create a new one in case of failure.
+     if(cps_open(NULL) < 0)
+     {
+@@ -52,6 +44,26 @@ void openrtx_init()
+         }
+     }
+ 
++    #ifdef CONFIG_TYT_CPS
++    if (cps_fallbackActive()) {
++        // Start on the first recovery channel instead of the saved VFO.
++        cps_readChannel(&state.channel, 0);
++        state.vfo_channel = state.channel;
++        state.channel_index = 0;
++        state.bank_enabled = false;
++        state.txDisable = state.channel.rx_only;
++    }
++    #endif
++
++
++    gfx_init();         // Initialize display and graphics driver
++    kbd_init();         // Initialize keyboard driver
++    ui_init();          // Initialize user interface
++    vp_init();          // Initialize voice prompts
++    #ifdef CONFIG_SCREEN_CONTRAST
++    display_setContrast(state.settings.contrast);
++    #endif
++
+     // Display splash screen, turn on backlight after a suitable time to
+     // hide random pixels during render process
+     ui_drawSplashScreen();
+diff --git a/openrtx/src/core/state.c b/openrtx/src/core/state.c
+index 4e8e063..e4b836f 100644
+--- a/openrtx/src/core/state.c
++++ b/openrtx/src/core/state.c
+@@ -15,6 +15,9 @@
+ #include "interfaces/platform.h"
+ #include "interfaces/nvmem.h"
+ #include "interfaces/delays.h"
++#ifdef CONFIG_TYT_CPS
++#include "interfaces/cps_io.h"
++#endif
+ 
+ state_t state;
+ pthread_mutex_t state_mutex;
+@@ -76,7 +79,11 @@ void state_terminate()
+         state.settings.brightness = 5;
+     }
+ 
+-    nvm_writeSettingsAndVfo(&state.settings, &state.channel);
++    #ifdef CONFIG_TYT_CPS
++    // Recovery defaults are ephemeral; preserve the saved settings/VFO too.
++    if (!cps_fallbackActive())
++    #endif
++        nvm_writeSettingsAndVfo(&state.settings, &state.channel);
+     pthread_mutex_destroy(&state_mutex);
+ }
+ 
+diff --git a/platform/drivers/CPS/cps_io_native_tyt.c b/platform/drivers/CPS/cps_io_native_tyt.c
+new file mode 100644
+index 0000000..b85f2aa
+--- /dev/null
++++ b/platform/drivers/CPS/cps_io_native_tyt.c
+@@ -0,0 +1,383 @@
++/*
++ * SPDX-FileCopyrightText: Copyright 2026 OpenRTX Contributors
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++#include "interfaces/cps_io.h"
++#include "interfaces/platform.h"
++#include "core/nvmem_device.h"
++#include <stdlib.h>
++#include <string.h>
++#include <stdio.h>
++
++/* Native layouts: cps_data_MD3x0.h / cps_data_MDUV3x0.h, and
++ * https://github.com/OpenRTX/dmrconfig/blob/master/md380.c
++ * https://github.com/sergev/dmrconfig/blob/master/uv380.c
++ * Offsets below are SPI-flash addresses, not offsets in a downloaded image.
++ */
++#ifdef PLATFORM_MD3x0
++enum {
++    CHANNEL_BASE = 0x1ee00,
++    CONTACT_BASE = 0x05f80,
++    MAX_CHANNELS = 1000,
++    MAX_CONTACTS = 1000,
++    ZONE_MEMBERS = 16
++};
++#else
++enum {
++    CHANNEL_BASE = 0x110000,
++    CONTACT_BASE = 0x140000,
++    MAX_CHANNELS = 3000,
++    MAX_CONTACTS = 10000,
++    ZONE_MEMBERS = 64
++};
++#endif
++enum {
++    ZONE_BASE = 0x149e0,
++    ZONE_EXT_BASE = 0x31000,
++    MAX_ZONES = 250,
++    CHANNEL_SIZE = 64,
++    ZONE_SIZE = 64,
++    ZONE_EXT_SIZE = 224,
++    CONTACT_SIZE = 36,
++    NAME_UNITS = 16,
++    PMR_CHANNELS = 16,
++    PMR_FIRST = 446006250,
++    PMR_STEP = 12500
++};
++
++extern const struct nvmDevice eflash;
++static uint16_t *channels;
++static uint16_t channel_count;
++static uint16_t zones[MAX_ZONES];
++static uint16_t zone_count;
++static uint32_t fallback_frequency;
++static uint16_t fallback_count;
++static bool opened;
++
++static uint16_t read16(const uint8_t *data)
++{
++    return data[0] | ((uint16_t)data[1] << 8);
++}
++
++/* Never cast packed UTF-16 to wchar_t. Full-width names need no terminator
++ * in flash; the display string always has one. Unsupported glyphs become '?'.
++ */
++static bool read_name(char *name, const uint8_t *raw)
++{
++    memset(name, 0, CPS_STR_SIZE);
++    bool visible = false;
++    for (size_t i = 0; i < NAME_UNITS; ++i) {
++        uint16_t unit = read16(raw + 2 * i);
++        if ((unit == 0) || (unit == 0xffff))
++            break;
++        if ((unit < 32) || (unit == 127) || (unit == 0xfffe))
++            return false;
++        if ((unit >= 0xd800) && (unit <= 0xdfff)) {
++            if ((unit > 0xdbff) || (i + 1 == NAME_UNITS))
++                return false;
++            uint16_t low = read16(raw + 2 * (i + 1));
++            if ((low < 0xdc00) || (low > 0xdfff))
++                return false;
++            name[i++] = '?';
++            name[i] = '?';
++        } else {
++            name[i] = unit < 127 ? (char)unit : '?';
++        }
++        if (unit != ' ')
++            visible = true;
++    }
++    return visible;
++}
++
++static bool read_bcd(const uint8_t *raw, size_t bytes, uint32_t *value)
++{
++    uint32_t result = 0;
++    for (size_t i = bytes; i > 0; --i) {
++        uint8_t byte = raw[i - 1];
++        if (((byte >> 4) > 9) || ((byte & 15) > 9))
++            return false;
++        result = result * 100 + (byte >> 4) * 10 + (byte & 15);
++    }
++    *value = result;
++    return true;
++}
++
++static bool in_band(uint32_t frequency)
++{
++    const hwInfo_t *hw = platform_getHwInfo();
++    return (hw->uhf_band && (frequency >= hw->uhf_minFreq * 1000000u)
++            && (frequency <= hw->uhf_maxFreq * 1000000u))
++        || (hw->vhf_band && (frequency >= hw->vhf_minFreq * 1000000u)
++            && (frequency <= hw->vhf_maxFreq * 1000000u));
++}
++
++static int read_contact(contact_t *contact, uint16_t slot)
++{
++    uint8_t raw[CONTACT_SIZE];
++    memset(contact, 0, sizeof(*contact));
++    if ((slot >= MAX_CONTACTS)
++        || (nvm_devRead(&eflash, CONTACT_BASE + slot * CONTACT_SIZE, raw,
++                        sizeof(raw))
++            < 0))
++        return -1;
++    uint8_t type = raw[3] & 31;
++    uint32_t id = raw[0] | ((uint32_t)raw[1] << 8) | ((uint32_t)raw[2] << 16);
++    if (!read_name(contact->name, raw + 4) || (type < 1) || (type > 3)
++        || (id == 0))
++        return -1;
++    contact->mode = OPMODE_DMR;
++    contact->info.dmr.id = id;
++    contact->info.dmr.contactType = type - 1;
++    contact->info.dmr.rx_tone = (raw[3] >> 5) & 1;
++    return 0;
++}
++
++static int tone_index(const uint8_t *raw)
++{
++    uint32_t value;
++    if (!read_bcd(raw, 2, &value))
++        return -1;
++    for (size_t i = 0; i < CTCSS_FREQ_NUM; ++i)
++        if (ctcss_tone[i] == value)
++            return (int)i;
++    return -1;
++}
++
++static int read_channel(channel_t *channel, uint16_t slot)
++{
++    uint8_t raw[CHANNEL_SIZE];
++    memset(channel, 0, sizeof(*channel));
++    if ((slot >= MAX_CHANNELS)
++        || (nvm_devRead(&eflash, CHANNEL_BASE + slot * CHANNEL_SIZE, raw,
++                        sizeof(raw))
++            < 0))
++        return -1;
++    uint8_t mode = raw[0] & 3;
++    uint8_t bandwidth = (raw[0] >> 2) & 3;
++    uint32_t rx, tx;
++    if (!read_name(channel->name, raw + 32)
++        || ((mode != OPMODE_FM) && (mode != OPMODE_DMR)) || (bandwidth > 2)
++        || (raw[11] > 250) || (raw[12] > 250) || !read_bcd(raw + 16, 4, &rx)
++        || !in_band(rx * 10))
++        return -1;
++    bool rx_only = (raw[1] & 2) != 0;
++    bool tx_unset = ((read16(raw + 20) == 0xffff)
++                     && (read16(raw + 22) == 0xffff))
++                 || ((read16(raw + 20) == 0) && (read16(raw + 22) == 0));
++    if (rx_only && tx_unset) {
++        tx = rx;
++    } else if (!read_bcd(raw + 20, 4, &tx) || !in_band(tx * 10)) {
++        return -1;
++    }
++    channel->mode = mode;
++    channel->bandwidth = bandwidth == 0 ? BW_12_5 : BW_25;
++    channel->rx_only = rx_only;
++    channel->rx_frequency = rx * 10;
++    channel->tx_frequency = tx * 10;
++    channel->scanList_index = raw[11];
++    channel->groupList_index = raw[12];
++#ifdef PLATFORM_MD3x0
++    channel->power = (raw[4] & 32) ? 5000 : 1000;
++#else
++    uint8_t power = raw[30] & 3;
++    if (power == 0)
++        return -1;
++    channel->power = power == 3 ? 5000 : (power == 2 ? 2500 : 1000);
++#endif
++    if (mode == OPMODE_FM) {
++        int rx_tone = tone_index(raw + 24);
++        int tx_tone = tone_index(raw + 26);
++        channel->fm.rxToneEn = rx_tone >= 0;
++        channel->fm.txToneEn = tx_tone >= 0;
++        channel->fm.rxTone = rx_tone >= 0 ? rx_tone : 0;
++        channel->fm.txTone = tx_tone >= 0 ? tx_tone : 0;
++        // Unrecognised tones (including unsupported DCS) stay disabled.
++    } else {
++        uint8_t slot_number = (raw[1] >> 2) & 3;
++        uint16_t contact = read16(raw + 6);
++        contact_t decoded;
++        if ((slot_number < 1) || (slot_number > 2) || (contact > MAX_CONTACTS)
++            || ((contact != 0) && (read_contact(&decoded, contact - 1) < 0)))
++            return -1;
++        channel->dmr.contact_index = contact == 0 ? 0 : contact - 1;
++        channel->dmr.dmr_timeslot = slot_number;
++        channel->dmr.rxColorCode = raw[1] >> 4;
++        channel->dmr.txColorCode = raw[1] >> 4;
++    }
++    return 0;
++}
++
++/* Translate a vendor one-based slot reference to the compact UI channel list. */
++static int channel_index(uint16_t reference)
++{
++    if ((reference == 0) || (reference > MAX_CHANNELS))
++        return -1;
++    size_t low = 0, high = channel_count;
++    while (low < high) {
++        size_t mid = low + (high - low) / 2;
++        if (channels[mid] < reference - 1)
++            low = mid + 1;
++        else
++            high = mid;
++    }
++    if ((low == channel_count) || (channels[low] != reference - 1))
++        return -1;
++    return (int)low;
++}
++
++static int read_zone(bankHdr_t *header, uint16_t slot, uint16_t wanted)
++{
++    uint8_t raw[ZONE_SIZE], ext[ZONE_EXT_SIZE];
++    memset(header, 0, sizeof(*header));
++    if ((slot >= MAX_ZONES)
++        || (nvm_devRead(&eflash, ZONE_BASE + slot * ZONE_SIZE, raw, sizeof(raw))
++            < 0)
++        || !read_name(header->name, raw))
++        return -1;
++    if ((ZONE_MEMBERS > 16)
++        && (nvm_devRead(&eflash, ZONE_EXT_BASE + slot * ZONE_EXT_SIZE, ext,
++                        sizeof(ext))
++            < 0))
++        return -1;
++    int selected = -1;
++    for (size_t i = 0; i < ZONE_MEMBERS; ++i) {
++        const uint8_t *entry = i < 16 ? raw + 32 + 2 * i : ext + 2 * (i - 16);
++        int index = channel_index(read16(entry));
++        if (index < 0)
++            continue;
++        if (header->ch_count == wanted)
++            selected = index;
++        ++header->ch_count;
++    }
++    return selected;
++}
++
++bool cps_fallbackActive(void)
++{
++    return opened && (fallback_count != 0);
++}
++
++static int fallback_channel(channel_t *channel, uint16_t pos)
++{
++    memset(channel, 0, sizeof(*channel));
++    if (pos >= fallback_count)
++        return -1;
++    channel->mode = OPMODE_FM;
++    channel->bandwidth = BW_12_5;
++    channel->rx_only = false;
++    channel->power = 1000;
++    channel->rx_frequency = fallback_frequency + pos * PMR_STEP;
++    channel->tx_frequency = channel->rx_frequency;
++    // Recovery channels use the calibrated low-power setting (1 W).
++    if (fallback_count == PMR_CHANNELS)
++        snprintf(channel->name, sizeof(channel->name), "PMR %02u", pos + 1u);
++    else
++        strcpy(channel->name, "FM CALL");
++    return 0;
++}
++
++int cps_open(char *name)
++{
++    (void)name;
++    if (opened)
++        return -1;
++    channels = malloc(MAX_CHANNELS * sizeof(*channels));
++    if (channels != NULL) {
++        channel_t channel;
++        for (uint16_t i = 0; i < MAX_CHANNELS; ++i)
++            if (read_channel(&channel, i) == 0)
++                channels[channel_count++] = i;
++    }
++    if (channel_count == 0) {
++        free(channels);
++        channels = NULL;
++        if (in_band(PMR_FIRST) && in_band(PMR_FIRST + 15 * PMR_STEP)) {
++            fallback_frequency = PMR_FIRST;
++            fallback_count = PMR_CHANNELS;
++        } else if (in_band(145500000)) {
++            // Never tune a VHF-only MD-390 to unsupported UHF frequencies.
++            fallback_frequency = 145500000;
++            fallback_count = 1;
++        } else {
++            return -1; // Hardware band information is itself unusable.
++        }
++        puts("Codeplug invalid/empty: using fallback channels in RAM");
++    } else {
++        for (uint16_t i = 0; i < MAX_ZONES; ++i) {
++            bankHdr_t header;
++            read_zone(&header, i, 0);
++            if (header.ch_count != 0)
++                zones[zone_count++] = i;
++        }
++        printf("Codeplug: %u valid channels, %u valid banks\n", channel_count,
++               zone_count);
++    }
++    opened = true;
++    return 0;
++}
++
++void cps_close(void)
++{
++    free(channels);
++    channels = NULL;
++    channel_count = zone_count = fallback_count = 0;
++    opened = false;
++}
++
++int cps_create(char *name)
++{
++    (void)name;
++    return -1; // Native codeplug flash is never created/erased automatically.
++}
++
++int cps_readChannel(channel_t *channel, uint16_t pos)
++{
++    memset(channel, 0, sizeof(*channel));
++    if (!opened)
++        return -1;
++    if (fallback_count != 0)
++        return fallback_channel(channel, pos);
++    if (pos >= channel_count)
++        return -1;
++    return read_channel(channel, channels[pos]);
++}
++
++int cps_readBankHeader(bankHdr_t *header, uint16_t pos)
++{
++    memset(header, 0, sizeof(*header));
++    if (!opened)
++        return -1;
++    if (fallback_count != 0) {
++        if (pos != 0)
++            return -1;
++        strcpy(header->name,
++               fallback_count == PMR_CHANNELS ? "PMR TX/RX" : "VHF FM CALL");
++        header->ch_count = fallback_count;
++        return 0;
++    }
++    if (pos >= zone_count)
++        return -1;
++    read_zone(header, zones[pos], 0);
++    return header->ch_count == 0 ? -1 : 0;
++}
++
++int cps_readBankData(uint16_t bank, uint16_t pos)
++{
++    if (!opened)
++        return -1;
++    if (fallback_count != 0)
++        return ((bank == 0) && (pos < fallback_count)) ? pos : -1;
++    if ((bank >= zone_count) || (pos >= ZONE_MEMBERS))
++        return -1;
++    bankHdr_t header;
++    return read_zone(&header, zones[bank], pos);
++}
++
++int cps_readContact(contact_t *contact, uint16_t pos)
++{
++    memset(contact, 0, sizeof(*contact));
++    if (!opened || (fallback_count != 0))
++        return -1;
++    return read_contact(contact, pos);
++}
